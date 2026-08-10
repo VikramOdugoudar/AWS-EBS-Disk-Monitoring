@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — VPC endpoints for one workload account VPC. Deployed PER ACCOUNT
+  with that account's VPC parameters, because VPC IDs are globally unique and a
+  StackSet applies one parameter set to all targets.
+
+  WHY THIS IS SEPARATE FROM 10-workload-iam.yaml
+  Every parameter below is account-specific, so this stack cannot auto-deploy to an OU
+  the way the IAM stack can. Keeping these 6 resources in the same template as that
+  stack's 13 would let them block it: its 3 parameters hold the same value in every
+  account, while every parameter below is account-specific — and a StackSet cannot
+  supply a different VpcId per account.
+
+  Splitting does not make networking zero-touch — nothing can, in an unknown network.
+  It stops networking from BLOCKING the parts that genuinely are.
+
+  ASSUMPTION: instances have NO internet egress (no NAT), so these endpoints are
+  MANDATORY, not an optimization. Without them SSM cannot register, Ansible cannot
+  connect, and metrics cannot be published.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the instances to monitor.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Private subnets for the interface endpoints — one per AZ where instances run.
+      An AZ without an endpoint ENI cannot reach the service.
+
+  InstanceSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security group attached to monitored instances. Referenced by the endpoint SG to
+      allow 443 inbound.
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Route tables to associate with the free S3 gateway endpoint. A subnet whose route
+      table is not listed cannot reach S3.
+
+Resources:
+
+  # ===========================================================================
+  # ENDPOINT SECURITY GROUP
+  #
+  # "No inbound rules on instances" is NOT "no rules anywhere" — the ENDPOINTS need
+  # 443 inbound from the instance SG. Missing this is a common cause of a silent
+  # "nothing works": SSM registration times out with no obvious explanation.
+  # ===========================================================================
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from monitored instances to interface endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroupId
+          Description: HTTPS from monitored instances
+      Tags:
+        - Key: Name
+          Value: disk-monitoring-endpoints
+        - Key: Project
+          Value: disk-monitoring
+
+  # ===========================================================================
+  # INTERFACE ENDPOINTS
+  #
+  # All four require PrivateDnsEnabled plus VPC enableDnsSupport/enableDnsHostnames,
+  # or the service DNS names will not resolve to the endpoint.
+  #
+  # Cost: ~$7.30/AZ/month per endpoint (~$88 per VPC at 4 x 3 AZs). Data processing is
+  # $0.01/GB vs NAT's $0.045/GB — see docs/06 for the endpoint-vs-NAT comparison.
+  # ===========================================================================
+
+  # SSM Agent registration and command polling.
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # Session Manager data channel — this is what Ansible's connection rides on.
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # Run Command message delivery — how EventBridge-triggered playbook runs reach the
+  # controller and how the remediation runbook reaches instances.
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # THE METRIC DATA PATH. Easy to forget, and its absence is confusing to debug:
+  # SSM works perfectly, Ansible succeeds, the agent runs — and no metric ever
+  # arrives, because PutMetricData cannot reach CloudWatch. The alarms then sit in
+  # INSUFFICIENT_DATA, looking calm while monitoring nothing.
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # S3 GATEWAY ENDPOINT — FREE, and load-bearing for two consumers:
+  #   1. Ansible module transit (the instance curls a presigned URL for each task's
+  #      module file, because Session Manager has no file-transfer channel)
+  #   2. The CloudWatch agent package and Amazon Linux repos (both S3-backed)
+  #
+  # Omitting it silently breaks all configuration. Worth adding even where NAT exists
+  # — see docs/06.
+  # ===========================================================================
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+Outputs:
+  EndpointSecurityGroupId:
+    Value: !Ref EndpointSecurityGroup
+
+  MonitoringEndpointId:
+    Description: >-
+      The metric data path. If metrics never appear despite Ansible succeeding, verify
+      this endpoint first.
+    Value: !Ref MonitoringEndpoint
+
+  S3GatewayEndpointId:
+    Description: Free, and required for Ansible module transit and package installs.
+    Value: !Ref S3GatewayEndpoint
