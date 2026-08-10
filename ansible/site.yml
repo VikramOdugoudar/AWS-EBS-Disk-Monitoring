@@ -1,0 +1,103 @@
+---
+# Disk monitoring — configure the CloudWatch agent across the fleet.
+#
+# Pushed from the controller in the monitoring account over SSM Session Manager
+# (amazon.aws.aws_ssm): no SSH, no inbound ports, no bastion. Hosts come from
+# tag-filtered dynamic inventory, so there is no host list to maintain.
+#
+# Triggered by EventBridge Rules 1-3 via Run Command on the controller — docs/02.
+# Usage:  ansible-playbook site.yml [--limit i-0abc123] [--check --diff]
+
+- name: Configure disk monitoring on managed EC2 instances
+  hosts: disk_monitoring
+  become: true
+
+  # The role needs ansible_mounts, so facts ARE required. But implicit gathering
+  # runs the setup module over the SSM connection BEFORE pre_tasks, and pre_tasks
+  # is where this play obtains the cross-account credentials that connection needs.
+  # Leaving this true would gather facts with no credentials and fail before the
+  # credential task ever ran. The explicit `setup` task at the end of pre_tasks
+  # restores fact gathering once the connection can authenticate.
+  gather_facts: false
+
+  # Bound the blast radius of a bad change. `serial` replaces the on-node model's
+  # MaxConcurrency; max_fail_percentage replaces MaxErrors. A systematically
+  # broken run stops after ~10% of the batch instead of hitting every host.
+  serial: "{{ disk_monitoring_serial | default('10%') }}"
+  max_fail_percentage: "{{ disk_monitoring_max_fail_percentage | default(5) }}"
+
+  # max_fail_percentage above does the bounding; any_errors_fatal would defeat it.
+  any_errors_fatal: false
+
+  # ==========================================================================
+  # CROSS-ACCOUNT CONNECTION CREDENTIALS
+  #
+  # Dynamic inventory solves *inventory* credentials (aws_ec2 takes
+  # assume_role_arn). It does NOT solve *connection* credentials: the aws_ssm
+  # connection plugin has NO assume_role_arn — its only credential inputs are
+  # access key / secret / session token / profile. Without them ssm:StartSession
+  # runs as the CONTROLLER and every task fails AccessDeniedException.
+  #
+  # So: assume DiskMonitoringSessionRole in the target account (account id comes
+  # from the `account_<id>` group keyed_groups already builds from owner_id) and
+  # inject the STS creds as hostvars. delegate_to: localhost — this must run on
+  # the controller, not on the host we cannot yet reach. run_once is deliberately
+  # NOT set: a `serial` batch spans accounts, so each host needs its own creds.
+  # ==========================================================================
+  pre_tasks:
+    - name: Resolve this host's account id from its inventory group
+      # keyed_groups (inventory) builds `account_<owner_id>`.
+      ansible.builtin.set_fact:
+        disk_monitoring_account_id: >-
+          {{ (group_names | select('match', '^account_') | first | default(''))
+             | regex_replace('^account_', '') }}
+      tags: [always]
+
+    - name: Fail early if the account id could not be resolved
+      # Without this the assume-role below would build a malformed ARN and fail
+      # with a confusing STS error instead of naming the real problem.
+      ansible.builtin.assert:
+        that:
+          - disk_monitoring_account_id is match('^[0-9]{12}$')
+        fail_msg: >-
+          Could not resolve an AWS account id for {{ inventory_hostname }} from
+          its inventory groups ({{ group_names | join(', ') }}). The aws_ec2
+          inventory must produce an `account_<id>` group via keyed_groups on
+          owner_id — check ansible/inventory/aws_ec2.yml.template.
+      tags: [always]
+
+    - name: Assume the session role in this host's account
+      amazon.aws.sts_assume_role:
+        role_arn: "arn:aws:iam::{{ disk_monitoring_account_id }}:role/{{ disk_monitoring_session_role_name }}"
+        role_session_name: "disk-monitoring-{{ inventory_hostname | replace('_', '-') }}"
+        region: "{{ ansible_aws_ssm_region }}"
+      delegate_to: localhost
+      become: false
+      register: disk_monitoring_assumed
+      # Credentials must never reach the log or the fact cache in cleartext.
+      no_log: true
+      retries: 3
+      delay: 5
+      until: disk_monitoring_assumed is succeeded
+      tags: [always]
+
+    - name: Hand the assumed credentials to the SSM connection
+      # These three hostvars are what the aws_ssm plugin actually reads. Setting
+      # them here rebinds the connection for every subsequent task on this host.
+      ansible.builtin.set_fact:
+        ansible_aws_ssm_access_key_id: "{{ disk_monitoring_assumed.sts_creds.access_key }}"
+        ansible_aws_ssm_secret_access_key: "{{ disk_monitoring_assumed.sts_creds.secret_key }}"
+        ansible_aws_ssm_session_token: "{{ disk_monitoring_assumed.sts_creds.session_token }}"
+      no_log: true
+      tags: [always]
+
+    - name: Gather facts now that the connection can authenticate
+      # First task that actually touches the target.
+      ansible.builtin.setup:
+      tags: [always]
+
+  roles:
+    - role: cw_agent
+      tags:
+        - cw_agent
+        - disk_monitoring

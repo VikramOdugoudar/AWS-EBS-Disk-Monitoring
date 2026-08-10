@@ -1,0 +1,54 @@
+---
+# Connection settings for every managed host. Access model is Step 1's — SSM
+# Session Manager, no SSH keys, no inbound 22, works in no-egress subnets.
+
+ansible_connection: amazon.aws.aws_ssm
+
+ansible_aws_ssm_region: "{{ lookup('env', 'AWS_REGION') | default('ap-south-1', true) }}"
+
+# S3 module-transfer bucket — MANDATORY, not a distribution mechanism. Session
+# Manager has no file-transfer channel, so every task's module payload is staged
+# through S3 (even `command`/`shell`). It cannot be disabled — docs/02.
+#
+# One CENTRAL bucket (monitoring account, org-scoped read). Contents live for
+# seconds, so per-account isolation bought little. Versioning is OFF because task
+# parameters can embed secrets and would persist in version history in cleartext.
+ansible_aws_ssm_bucket_name: "{{ lookup('env', 'DISK_MONITORING_TRANSFER_BUCKET') }}"
+
+ansible_aws_ssm_bucket_sse_mode: AES256
+
+# Path-style addressing is the reliable choice when reaching S3 through a
+# gateway endpoint.
+ansible_aws_ssm_s3_addressing_style: path
+
+# Session Manager timeouts. Module transfer plus a data-channel round trip makes
+# this slower than SSH, so the default 60s is tight on a busy host.
+ansible_aws_ssm_timeout: 120
+ansible_aws_ssm_reconnection_retries: 3
+
+# The plugin does not support ansible_user/remote_user — commands run as the
+# ssm-agent user (normally root). Privilege escalation is via become.
+ansible_become: true
+ansible_become_method: ansible.builtin.sudo
+
+# Amazon Linux 2023 ships Python 3 at this path; setting it explicitly avoids a
+# discovery round trip per host.
+ansible_python_interpreter: /usr/bin/python3
+
+# --- Cross-account connection credentials -----------------------------------
+# Assumed per-account by site.yml's pre_tasks (aws_ssm has no assume_role_arn —
+# see the banner there). Created in every workload account by 10-workload-iam.yaml;
+# its ssm:StartSession grant is scoped by ssm:resourceTag/DiskMonitoring, so it
+# cannot open sessions to instances outside the monitored fleet.
+disk_monitoring_session_role_name: DiskMonitoringSessionRole
+
+# --- Rollout controls (consumed by site.yml) --------------------------------
+# NOTE ON CREDENTIAL LIFETIME. pre_tasks re-runs per `serial` batch, so each
+# batch assumes fresh credentials and a long fleet-wide run does not outlive a
+# single STS session. But credentials are NOT refreshed WITHIN a batch, so the
+# batch must finish inside the role's max session duration (default 1 hour).
+# At ~1-2 minutes per host over SSM, 10% of a 1,000-host fleet is ~100 hosts per
+# batch with forks=25 — comfortably inside the hour. If a batch ever approaches
+# it, lower `serial` rather than raising the role's MaxSessionDuration.
+disk_monitoring_serial: "10%"
+disk_monitoring_max_fail_percentage: 5

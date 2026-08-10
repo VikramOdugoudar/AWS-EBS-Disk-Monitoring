@@ -1,0 +1,20 @@
+---
+# Collections required ON THE CONTROLLER ONLY.
+#
+# The cw_agent role uses only ansible.builtin, so managed instances need nothing
+# installed; amazon.aws is controller-side only (connection + inventory plugins).
+#
+# Install:  ansible-galaxy collection install -r requirements.yml
+#
+# Python prerequisites on the controller:
+#   ansible-core >= 2.15
+#   boto3 >= 1.35.0, botocore >= 1.35.0   (required by amazon.aws 11.x)
+#   session-manager-plugin                (required by the aws_ssm connection)
+
+collections:
+  - name: amazon.aws
+    version: ">=11.0.0"
+    # Provides:
+    #   amazon.aws.aws_ssm  — connection plugin (moved here from community.aws in
+    #                         6.0.0; the community.aws FQCN is now only a redirect)
+    #   amazon.aws.aws_ec2  — dynamic inventory plugin

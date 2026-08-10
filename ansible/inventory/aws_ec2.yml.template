@@ -1,0 +1,81 @@
+---
+# Dynamic inventory — the controller discovers instances at runtime.
+#
+# THE TAG IS THE ENTIRE INTERFACE. There is no host list anywhere: inventory is
+# derived from tags on every run, so tagging an instance puts it in scope and
+# un-tagging removes it. That is what makes enrollment O(1) to operate at any
+# fleet size.
+#
+# There is no background "inventory refresh" — inventory is computed fresh at the
+# start of each run. A new account therefore needs no configuration change here;
+# it needs a trigger, which is EventBridge Rule 3.
+
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - "{{ lookup('env', 'AWS_REGION') | default('ap-south-1', true) }}"
+
+# Assume this account's inventory role. __ACCOUNT_ID__ is substituted by
+# scripts/render_inventory.sh, which emits one rendered file per account.
+#
+# WHY ONE FILE PER ACCOUNT: `assume_role_arn` is a single STRING, not a list (so is
+# `profile`). Only `regions` is a list — because Regions are just a parameter on the
+# same API call with the SAME credentials, which the plugin loops internally, whereas
+# each account needs DIFFERENT credentials via sts:AssumeRole and its own
+# authenticated client. The plugin cannot hold several credential contexts at once.
+# Ansible merges every source in this directory, so N files is simply how N
+# identities get expressed. The account LIST is still fully dynamic.
+assume_role_arn: "arn:aws:iam::__ACCOUNT_ID__:role/DiskMonitoringInventoryRole"
+
+filters:
+  # Enrollment gate. Applied by the launch template, or by AWS Config
+  # remediation (AWS-SetRequiredTags) if it was missed.
+  tag:DiskMonitoring: enabled
+
+  # KEEP THIS. Without it, stopped/stopping/terminated/pending instances enter
+  # inventory; Ansible attempts Session Manager connections that cannot succeed,
+  # and each becomes a task FAILURE (not a skip) counting toward
+  # max_fail_percentage — enough of them abort the run for healthy hosts.
+  # Terminated instances linger in describe-instances for up to an hour, so this
+  # is routine in any fleet with churn.
+  instance-state-name: running
+
+# The connection plugin uses the connection host as the SSM target ID when
+# ansible_aws_ssm_instance_id is unset — so inventory MUST yield instance IDs,
+# not Name tags.
+hostnames:
+  - instance-id
+
+keyed_groups:
+  - key: tags.Environment | default('unscoped')
+    prefix: env
+    separator: "_"
+  - key: placement.availability_zone
+    prefix: az
+    separator: "_"
+  - key: owner_id
+    prefix: account
+    separator: "_"
+
+groups:
+  # The group site.yml targets. Everything matching the filters qualifies.
+  disk_monitoring: true
+
+compose:
+  # Explicit SSM target ID — belt and braces alongside `hostnames`.
+  ansible_aws_ssm_instance_id: instance_id
+
+  # NOT consumed by the role — defaults/main.yml re-derives this independently.
+  # Kept as the inventory-side normalization only; changing it does NOT move the
+  # Environment metric dimension.
+  ec2_environment: ec2_tags.Environment | default('unscoped')
+
+# Cache inventory briefly so a bulk run (Rule 3, hundreds of instances) does not
+# re-query EC2 for every batch.
+cache: true
+cache_plugin: jsonfile
+cache_timeout: 300
+cache_connection: /tmp/ansible_inventory_cache
+
+# Do not emit legacy `ec2_tag_<Key>` vars; the role reads ec2_tags.
+use_contrib_script_compatible_ec2_tag_keys: false
