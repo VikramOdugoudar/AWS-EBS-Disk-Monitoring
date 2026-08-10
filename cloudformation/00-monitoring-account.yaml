@@ -1,0 +1,501 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — monitoring account foundation. Deploy FIRST: workload accounts
+  create OAM links that reference this sink, so the sink ARN must exist before the
+  workload StackSet runs.
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: >-
+      AWS Organization ID (o-xxxxxxxxxx). Scopes the sink policy so ANY account
+      joining the org can link WITHOUT editing this policy — which is what makes
+      account onboarding zero-touch.
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+
+  WarningEmail:
+    Type: String
+    Description: Email address for 80% warning notifications.
+
+  CriticalEmail:
+    Type: String
+    Description: Email address for 90% critical notifications (also triggers remediation).
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # OAM sink — the attachment point workload accounts link to.
+  #
+  # BILATERAL CONSENT: this policy says who MAY attach; each workload account's
+  # link says who DOES attach. Neither side alone is sufficient, so account
+  # isolation is preserved and both halves are auditable. The monitoring account
+  # cannot reach in and harvest data.
+  #
+  # Metric sharing is FREE, and no data moves — the monitoring account gains
+  # query access, so there is no pipeline to fall behind or backfill.
+  # ---------------------------------------------------------------------------
+  DiskMonitoringSink:
+    Type: AWS::Oam::Sink
+    Properties:
+      Name: disk-monitoring-sink
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - oam:CreateLink
+              - oam:UpdateLink
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+              ForAllValues:StringEquals:
+                # Metrics only — no logs or traces. Note this namespace-level
+                # scoping is exactly what CloudWatch Metrics Centralization
+                # cannot do (it replicates ALL custom metrics), and is a key
+                # reason OAM was chosen. See docs/04.
+                oam:ResourceTypes:
+                  - AWS::CloudWatch::Metric
+      Tags:
+        Project: disk-monitoring
+
+  # ---------------------------------------------------------------------------
+  # Notification topics. Two topics so warnings and critical alerts route
+  # differently — a warning that pages at 3am trains people to ignore alerts.
+  # ---------------------------------------------------------------------------
+  WarningTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: disk-monitoring-warning
+      DisplayName: Disk Warning (80%)
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  WarningSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WarningTopic
+      Protocol: email
+      Endpoint: !Ref WarningEmail
+
+  CriticalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: disk-monitoring-critical
+      DisplayName: Disk Critical (90%)
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  CriticalSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CriticalTopic
+      Protocol: email
+      Endpoint: !Ref CriticalEmail
+
+  # ---------------------------------------------------------------------------
+  # S3 module-transfer bucket. MANDATORY, and not a distribution mechanism:
+  # Session Manager has no file-transfer channel, so each task's ~50KB module file
+  # stages through S3 (true even for `command` tasks). One central bucket because
+  # contents live for seconds and one bucket is one config value. See docs/02.
+  # ---------------------------------------------------------------------------
+  ModuleTransferBucket:
+    Type: AWS::S3::Bucket
+    # Retain avoids losing the bucket on a stack replacement while a run is in
+    # flight; contents expire in a day regardless.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'disk-monitoring-ansible-transfer-${AWS::AccountId}-${AWS::Region}'
+      # VERSIONING DELIBERATELY OFF (Suspended). Module files carry interpolated
+      # task parameters which can embed secrets; with versioning enabled, deleted
+      # objects persist in version history in cleartext. The plugin deletes files
+      # at task end, but versioning would defeat that.
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Belt and braces: an ungraceful controller termination could leave
+          # objects behind.
+          - Id: ExpireTransientModules
+            Status: Enabled
+            ExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  ModuleTransferBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ModuleTransferBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Org-scoped read so instances in any workload account can fetch their
+          # staged modules via presigned URL through the S3 gateway endpoint.
+          - Sid: OrgReadForModuleFetch
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${ModuleTransferBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ModuleTransferBucket.Arn
+              - !Sub '${ModuleTransferBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
+  # Ansible controller instance profile.
+  #
+  # The controller is NOT in the data path: if it is down, configuration changes
+  # cannot be deployed, but the CloudWatch agent keeps publishing, alarms keep
+  # evaluating, and remediation keeps working.
+  # ---------------------------------------------------------------------------
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringControllerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # So the controller itself is an SSM managed node — which is how
+        # EventBridge invokes playbook runs on it via Run Command.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AssumeWorkloadAccountRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                # Named roles only, created by the workload StackSet.
+                #   Inventory — DescribeInstances for dynamic inventory
+                #   Session   — ssm:StartSession for the Ansible CONNECTION
+                #               (see SessionRole in 10-workload-iam.yaml)
+                #   Read      — DescribeVolumes / remediation
+                Resource:
+                  - !Sub 'arn:aws:iam::*:role/DiskMonitoringInventoryRole'
+                  - !Sub 'arn:aws:iam::*:role/DiskMonitoringSessionRole'
+                  - !Sub 'arn:aws:iam::*:role/DiskMonitoringReadRole'
+                Condition:
+                  StringEquals:
+                    # aws:ResourceOrgID, NOT aws:PrincipalOrgID — the two are not
+                    # interchangeable and the wrong one silently restricts nothing. The
+                    # account in the ARNs above is a WILDCARD, so the TARGET is what
+                    # needs bounding: PrincipalOrgID describes the CALLER (always this
+                    # controller, always in this org) and is tautologically true.
+                    # Matters most for DiskMonitoringSessionRole, which grants
+                    # ssm:StartSession — a root shell on tagged instances.
+                    # Full argument: docs/01-access-management.md.
+                    aws:ResourceOrgID: !Ref OrganizationId
+        - PolicyName: DiscoverAccounts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Runtime account enumeration — so no static account list exists
+              # anywhere and a new account needs no config change.
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:ListAccountsForParent
+                  - organizations:ListOrganizationalUnitsForParent
+                Resource: '*'
+        - PolicyName: SsmSessionAndTransfer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartSession
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeSessions
+                  - ssm:GetConnectionStatus
+                Resource: '*'
+              # Module staging. The controller needs write; targets need none —
+              # they fetch via presigned URL.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ModuleTransferBucket.Arn
+                  - !Sub '${ModuleTransferBucket.Arn}/*'
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  ControllerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: DiskMonitoringControllerProfile
+      Roles:
+        - !Ref ControllerRole
+
+  # ---------------------------------------------------------------------------
+  # EVENT BUS RESOURCE POLICY — without this, every forwarded event is DROPPED.
+  #
+  # Workload accounts' Rules 1 and 2 PutEvents to this account's `default` bus.
+  # The sending side is complete — the rules exist and their IAM role grants
+  # events:PutEvents — but cross-account PutEvents ALSO requires a resource
+  # policy on the RECEIVING bus, and a default bus has none unless one is added.
+  #
+  # WHY ITS ABSENCE IS SO HARD TO SPOT: the failure is asynchronous and lands on
+  # the receiving side as NotAuthorizedForSourceException, while the workload
+  # rule still reports a successful invocation because it did its job. So the
+  # sending account looks healthy and the events simply evaporate.
+  #
+  # Scoped by aws:PrincipalOrgID rather than an account list, consistent with the
+  # OAM sink and transfer-bucket policies — so a newly onboarded account can
+  # forward events with no policy edit here.
+  # ---------------------------------------------------------------------------
+  WorkloadEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: default
+      StatementId: AllowOrgAccountsToForwardInstanceEvents
+      Statement:
+        Effect: Allow
+        Principal: '*'
+        Action: events:PutEvents
+        Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+        Condition:
+          StringEquals:
+            aws:PrincipalOrgID: !Ref OrganizationId
+
+  # ---------------------------------------------------------------------------
+  # EVENTBRIDGE RULE 3 — a new account was onboarded.
+  #
+  # Lives HERE (monitoring account), not per-workload-account: one rule instead of
+  # N, and it watches the StackSet's own stack-creation events.
+  #
+  # WHY IT IS NEEDED. Rules 1 and 2 (in the workload baseline) are per-instance and
+  # event-driven, so an acquired account's EXISTING instances would be missed:
+  #   * no launch event will ever fire — they launched long ago
+  #   * a tag-change event fires only if a tag was MISSING
+  # So an instance that ALREADY carried DiskMonitoring=enabled (the acquired team
+  # used that tag, or a previous onboarding attempt set it) generates NO event at
+  # all and would never be configured. Rule 3 closes that hole with a bulk run.
+  #
+  # WHY STACK COMPLETION rather than Organizations events (MoveAccount /
+  # CreateAccount / AcceptHandshake):
+  #   * NATURALLY ORDERED — the account's IAM roles, endpoints and OAM link exist
+  #     before the controller tries to reach anything. An Organizations event could
+  #     fire before the StackSet has finished.
+  #   * STAYS IN-REGION — Organizations events are emitted only in us-east-1, which
+  #     would require a cross-Region event bus.
+  # ---------------------------------------------------------------------------
+  NewAccountOnboardedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disk-monitoring-new-account-onboarded
+      Description: >-
+        Bulk-configure every instance in a newly onboarded account once its
+        baseline stack is complete. Covers existing instances that generate no
+        launch or tag-change event.
+      EventPattern:
+        source:
+          - aws.cloudformation
+        detail-type:
+          - CloudFormation Stack Status Change
+        detail:
+          status-details:
+            status:
+              - CREATE_COMPLETE
+      State: ENABLED
+      Targets:
+        - Id: BulkConfigureNewAccount
+          # `serial` in site.yml bounds the batch, so 200 instances arriving at once
+          # stay orderly.
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/AWS-RunShellScript'
+          RoleArn: !GetAtt EventBridgeRunCommandRole.Arn
+          RunCommandParameters:
+            RunCommandTargets:
+              - Key: tag:Role
+                Values:
+                  - disk-monitoring-controller
+          # INPUT SHAPE IS NOT FREE-FORM. For an SSM Run Command target, EventBridge
+          # calls SendCommand on your behalf and requires exactly:
+          #
+          #   { "DocumentName": ..., "Parameters": { "key": ["value"] } }
+          #
+          # Putting `commands` and `executionTimeout` at the TOP LEVEL — the obvious
+          # reading, and what this template did originally — makes SendCommand reject
+          # every invocation. The `Parameters` wrapper is mandatory, and each value must
+          # be an ARRAY OF STRINGS even when it is a single scalar like a timeout.
+          #
+          # `set -euo pipefail` is first so a failure in the render or cd step aborts
+          # rather than running ansible-playbook from the wrong directory (where
+          # ansible.cfg's relative inventory/roles_path also break).
+          Input: !Sub |
+            {
+              "DocumentName": "AWS-RunShellScript",
+              "Parameters": {
+                "commands": [
+                  "set -euo pipefail",
+                  "export AWS_REGION=${AWS::Region}",
+                  "export AWS_STS_REGIONAL_ENDPOINTS=regional",
+                  "export DISK_MONITORING_TRANSFER_BUCKET=${ModuleTransferBucket}",
+                  "cd /opt/disk-monitoring",
+                  "./scripts/render_inventory.sh",
+                  "cd ansible",
+                  "ansible-playbook -i inventory site.yml"
+                ],
+                "executionTimeout": ["7200"]
+              }
+            }
+
+  EventBridgeRunCommandRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringEventBridgeRunCommandRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePlaybookOnController
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript'
+                  - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    # Scope to the controller only — this must not be able to run
+                    # arbitrary commands across the fleet.
+                    ssm:resourceTag/Role: disk-monitoring-controller
+
+  # Receives forwarded Rules 1 and 2 events from every workload account, and
+  # re-invokes the playbook locally for the single instance concerned.
+  ForwardedInstanceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disk-monitoring-forwarded-instance-events
+      Description: >-
+        Handles launch and tag-change events forwarded from workload accounts
+        (Rules 1 and 2), running the playbook for just that instance.
+      EventPattern:
+        source:
+          - aws.ec2
+          - aws.tag
+        detail-type:
+          - EC2 Instance State-change Notification
+          - Tag Change on Resource
+      State: ENABLED
+      Targets:
+        - Id: ConfigureSingleInstance
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/AWS-RunShellScript'
+          RoleArn: !GetAtt EventBridgeRunCommandRole.Arn
+          RunCommandParameters:
+            RunCommandTargets:
+              - Key: tag:Role
+                Values:
+                  - disk-monitoring-controller
+          InputTransformer:
+            InputPathsMap:
+              instanceId: '$.detail.instance-id'
+              # The forwarding account, so render_inventory.sh can scope to just that
+              # account rather than re-rendering the whole org on every instance event.
+              # AWS populates `account` on every event, so this is always present.
+              account: '$.account'
+            # Same mandatory DocumentName/Parameters shape as the bulk rule above.
+            #
+            # Note !Sub and EventBridge's <instanceId> placeholder do not collide: !Sub
+            # only interpolates ${...}, so <instanceId> passes through untouched for
+            # EventBridge to substitute at delivery time.
+            #
+            # --flush-cache clears the FACT cache, so cached ec2_tags cannot serve a
+            # STALE Environment — the exact failure the tag-change rule exists to prevent.
+            #
+            # It does NOT clear the INVENTORY cache (ansible.cfg [inventory]
+            # cache_timeout = 300). A 300s-old inventory predates a just-launched
+            # instance, so --limit matches nothing and still returns rc=0. Set
+            # ANSIBLE_INVENTORY_CACHE=False on this path too, and fail non-zero when
+            # --limit matches zero hosts, before relying on this rule.
+            InputTemplate: !Sub |
+              {
+                "DocumentName": "AWS-RunShellScript",
+                "Parameters": {
+                  "commands": [
+                    "set -euo pipefail",
+                    "export AWS_REGION=${AWS::Region}",
+                    "export AWS_STS_REGIONAL_ENDPOINTS=regional",
+                    "export DISK_MONITORING_TRANSFER_BUCKET=${ModuleTransferBucket}",
+                    "cd /opt/disk-monitoring",
+                    "./scripts/render_inventory.sh --accounts <account>",
+                    "cd ansible",
+                    "for i in 1 2 3; do ansible-playbook -i inventory site.yml --flush-cache --limit <instanceId> && break || sleep 30; done"
+                  ],
+                  "executionTimeout": ["1800"]
+                }
+              }
+
+Outputs:
+  SinkArn:
+    Description: >-
+      Pass to the workload StackSet as MonitoringSinkArn — each account's OAM link
+      references it.
+    Value: !GetAtt DiskMonitoringSink.Arn
+    Export:
+      Name: DiskMonitoringSinkArn
+
+  ModuleTransferBucketName:
+    Description: >-
+      Set as DISK_MONITORING_TRANSFER_BUCKET on the controller; consumed by
+      ansible_aws_ssm_bucket_name in group_vars/all.yml.
+    Value: !Ref ModuleTransferBucket
+    Export:
+      Name: DiskMonitoringTransferBucket
+
+  WarningTopicArn:
+    Value: !Ref WarningTopic
+    Export:
+      Name: DiskMonitoringWarningTopic
+
+  CriticalTopicArn:
+    Value: !Ref CriticalTopic
+    Export:
+      Name: DiskMonitoringCriticalTopic
+
+  ControllerInstanceProfileName:
+    Description: Attach to the Ansible controller EC2 instance.
+    Value: !Ref ControllerInstanceProfile
