@@ -1,0 +1,84 @@
+---
+# Defaults for the cw_agent role.
+#
+# CONSTRAINT: this role uses ONLY ansible.builtin modules and no external
+# collections. That is deliberate — it keeps the role portable and independent of
+# the Ansible version installed on the controller, and means it can also be run
+# on-node (via AWS-ApplyAnsiblePlaybooks) without bundling collections.
+
+# --- Agent package and service ---------------------------------------------
+cw_agent_package_name: amazon-cloudwatch-agent
+cw_agent_service_name: amazon-cloudwatch-agent
+cw_agent_run_as_user: cwagent
+
+cw_agent_config_dir: /opt/aws/amazon-cloudwatch-agent/etc
+cw_agent_config_path: "{{ cw_agent_config_dir }}/amazon-cloudwatch-agent.json"
+cw_agent_ctl: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+
+# --- Metric configuration ---------------------------------------------------
+# Namespace must stay CWAgent: the alarm queries use SCHEMA("CWAgent", ...).
+cw_agent_namespace: CWAgent
+
+# 60s is standard resolution. Anything below 60s becomes a high-resolution
+# metric, which costs 3x per alarm and is NOT supported by Metrics Insights.
+# Note: collection frequency does not affect metric cost at all — only the
+# number of unique dimension combinations does.
+cw_agent_collection_interval: 60
+
+# --- Cardinality controls (the cost levers) ---------------------------------
+# Pseudo-filesystems to exclude. `overlay` is the important one: without it a
+# container host publishes one metric per container layer.
+cw_agent_ignore_fstypes:
+  - tmpfs
+  - devtmpfs
+  - overlay
+  - squashfs
+  - iso9660
+  - autofs
+  - proc
+  - sysfs
+  - cgroup
+  - cgroup2
+  - devpts
+  - mqueue
+  - debugfs
+  - tracefs
+  - fusectl
+  - configfs
+  - binfmt_misc
+  - nsfs
+  # Observed live on AL2023 and absent from the original list. `vfat` is the one that
+  # actually leaked through and became a billable metric (/boot/efi) when resources
+  # was set to ["*"] — confirmed against a live instance during the pilot. A denylist
+  # fails OPEN, so it must be complete; the allowlist below fails CLOSED and is immune.
+  - vfat
+  - ramfs
+  - efivarfs
+  - pstore
+  - bpf
+  - selinuxfs
+  - securityfs
+  - hugetlbfs
+  - rpc_pipefs
+
+# Filesystems considered "real" disks worth monitoring. Anything not in this
+# list is skipped even if it survives the fstype rejectlist above.
+cw_agent_allowed_fstypes:
+  - ext2
+  - ext3
+  - ext4
+  - xfs
+  - btrfs
+
+# Mounts to monitor. Computed in tasks/main.yml from ansible_mounts, filtered by
+# the two lists above. NEVER set this to ["*"] — see the template header.
+cw_agent_monitored_mounts: []
+
+# --- Scope dimension --------------------------------------------------------
+# Environment is a metric dimension, so alarms can carry per-environment
+# thresholds (prod 80/90, dev 90/95).
+#
+# `ec2_tags`, NOT `tags` — the `tags` hostvar is deprecated in amazon.aws.aws_ec2
+# (removal after 2026-12-01). The default is required: an untagged instance would
+# fail the render, and 'unscoped' instances are surfaced by AWS Config.
+cw_agent_environment: "{{ ec2_tags.Environment | default('unscoped') }}"

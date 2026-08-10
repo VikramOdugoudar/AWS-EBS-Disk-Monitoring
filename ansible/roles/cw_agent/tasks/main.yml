@@ -1,0 +1,112 @@
+---
+# Install and configure the CloudWatch agent for disk monitoring.
+#
+# DIVISION OF LABOUR: Ansible owns *configuration* — what is collected and that
+# the agent is healthy. The agent owns the *data path* — it publishes
+# disk_used_percent continuously at 60s resolution, independent of Ansible.
+#
+# Ansible deliberately does NOT report disk usage itself, even though
+# `ansible_mounts` contains size_available. A scheduled tool produces datapoints
+# only when it runs; the agent produces them always. (There is also no Ansible
+# module for cloudwatch:PutMetricData in any collection.)
+
+- name: Verify SSM Agent is present and running
+  # SSM Agent is a PREREQUISITE, not something this role installs. The Ansible
+  # connection *is* SSM (amazon.aws.aws_ssm), so installing SSM Agent over that
+  # connection would be circular — Ansible cannot bootstrap its own transport.
+  # A Lambda cannot do it either: no AWS API can run commands inside an instance
+  # without SSM Agent, which is precisely the gap the agent exists to fill.
+  # Missing agent => fix at the AMI or userdata level.
+  # Catches "connected but agent unit not running"; a fully absent agent means
+  # Ansible could not have connected at all.
+  ansible.builtin.service_facts:
+
+- name: Fail early if SSM Agent is not running
+  ansible.builtin.assert:
+    that:
+      - "'amazon-ssm-agent.service' in ansible_facts.services"
+      - "ansible_facts.services['amazon-ssm-agent.service'].state == 'running'"
+    fail_msg: >-
+      SSM Agent is not running on {{ inventory_hostname }}. This instance cannot be
+      managed. Remediate at the AMI or userdata level — this role cannot install it.
+    success_msg: "SSM Agent is running."
+  when: cw_agent_verify_ssm_agent | default(true)
+
+- name: Determine which filesystems to monitor
+  # THE COST CONTROL. Builds the mount list from this host's own facts, keeping
+  # only real block-device filesystems (allowlist: ext*/xfs/btrfs). The rejectattr
+  # is belt-and-braces only — the two lists are disjoint today, so it removes
+  # nothing the allowlist admitted; the real second guard is the agent's own
+  # ignore_file_system_types in the rendered config.
+  # A static list would miss a newly attached volume or fall back to
+  # resources: ["*"], which on a container host costs ~11x. This adapts: mount a
+  # new volume and the next run includes it.
+  ansible.builtin.set_fact:
+    cw_agent_monitored_mounts: >-
+      {{
+        ansible_mounts
+        | selectattr('fstype', 'in', cw_agent_allowed_fstypes)
+        | rejectattr('fstype', 'in', cw_agent_ignore_fstypes)
+        | map(attribute='mount')
+        | sort
+        | list
+      }}
+
+- name: Show the mounts that will be monitored
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} — environment={{ cw_agent_environment }},
+      monitoring {{ cw_agent_monitored_mounts | length }} mount(s):
+      {{ cw_agent_monitored_mounts | join(', ') }}
+
+- name: Fail if no monitorable filesystem was found
+  # Publishing an empty resources list would start the agent successfully while
+  # collecting nothing — a silent failure. Better to fail loudly here.
+  ansible.builtin.assert:
+    that:
+      - cw_agent_monitored_mounts | length > 0
+    fail_msg: >-
+      No real block-device filesystems found on {{ inventory_hostname }}.
+      Check ansible_mounts and cw_agent_allowed_fstypes.
+
+- name: Install the CloudWatch agent
+  # Amazon Linux repos are S3-backed, so this works in a no-egress VPC via the
+  # S3 gateway endpoint. `package` resolves dnf/yum/apt per distro.
+  ansible.builtin.package:
+    name: "{{ cw_agent_package_name }}"
+    state: present
+  register: cw_agent_install
+  retries: 3
+  delay: 10
+  until: cw_agent_install is succeeded
+
+- name: Ensure the agent configuration directory exists
+  ansible.builtin.file:
+    path: "{{ cw_agent_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the CloudWatch agent configuration
+  # `validate` parses the JSON BEFORE the file is put in place. A malformed
+  # config stops the agent from starting, and since the agent produces our
+  # metrics that failure would be silent. This is the cheapest guard against the
+  # worst failure mode in the design.
+  ansible.builtin.template:
+    src: amazon-cloudwatch-agent.json.j2
+    dest: "{{ cw_agent_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+  notify: Apply CloudWatch agent configuration
+
+- name: Ensure the CloudWatch agent is running and enabled
+  # `enabled: true` makes it survive reboots — otherwise an instance silently
+  # stops reporting after its next restart.
+  ansible.builtin.service:
+    name: "{{ cw_agent_service_name }}"
+    state: started
+    enabled: true

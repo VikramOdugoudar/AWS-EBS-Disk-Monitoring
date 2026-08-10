@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated per-account Ansible inventory.
+# The account list is fetched from organizations:ListAccounts at runtime by
+# scripts/render_inventory.sh, so these files are never committed — only the
+# template they are rendered from.
+ansible/inventory/*.aws_ec2.yml
+
+# Local editor / OS noise
+.DS_Store

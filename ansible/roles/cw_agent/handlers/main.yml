@@ -1,0 +1,28 @@
+---
+# Handlers run only when a task reported `changed`, which is what makes re-runs
+# quiet: an unchanged configuration means the agent is never restarted.
+
+- name: Apply CloudWatch agent configuration
+  # `fetch-config -s` loads the config and restarts the agent. Reading from
+  # `file:` (not `ssm:`) because the playbook bundle is the single source of
+  # truth for configuration — Parameter Store is deliberately not in this path.
+  ansible.builtin.command:
+    cmd: >-
+      {{ cw_agent_ctl }}
+      -a fetch-config
+      -m ec2
+      -s
+      -c file:{{ cw_agent_config_path }}
+  register: cw_agent_fetch_config
+  changed_when: cw_agent_fetch_config.rc == 0
+
+- name: Confirm the agent is running after applying configuration
+  # A config the agent rejects at load time would leave it stopped — and a
+  # stopped agent means silently missing metrics. Verify rather than assume.
+  ansible.builtin.command:
+    cmd: "{{ cw_agent_ctl }} -a status"
+  register: cw_agent_status
+  changed_when: false
+  failed_when: >-
+    cw_agent_status.rc != 0 or '"status": "running"' not in cw_agent_status.stdout
+  listen: Apply CloudWatch agent configuration

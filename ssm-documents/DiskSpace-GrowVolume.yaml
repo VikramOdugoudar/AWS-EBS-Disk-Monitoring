@@ -1,0 +1,382 @@
+schemaVersion: '0.3'
+description: |
+  Grow the EBS volume behind a breaching filesystem — AWS-side remediation only.
+
+  SCOPE: this document performs the AWS-side actions (resolve volume, guard,
+  snapshot, ModifyVolume). It does NOT wait for the modification to reach
+  `completed`, so the notification reports the REQUEST, not the outcome. The
+  OS-side filesystem extension (growpart + resize2fs/xfs_growfs) is deliberately
+  NOT included.
+
+  ==> CONSEQUENCE: growing the volume alone does NOT free space inside the guest.
+      Until the filesystem-extension step exists, this document must NOTIFY rather
+      than report the problem solved. Do not treat a successful run as resolution.
+
+  VERIFIED AWS CONSTRAINTS shaping every guard below:
+    * maximum 4 modifications per volume per rolling 24 hours
+    * a modification must reach `completed` before another can start (sequential).
+      There is NO minimum cooldown — see the note above MAX_MODS_PER_24H.
+    * volumes can only GROW, never shrink -> EVERY ACTION IS IRREVERSIBLE
+    * modification is online on current-generation instances (no stop/detach)
+    * AWS's documented extend procedure does not cover RAID or LVM -> if the mount
+      cannot be proven to map to exactly one volume, ABORT and notify a human.
+      Partitions and single-volume roots ARE resolved host-side by the resolver step.
+
+  Because growth is irreversible, this is OPT-IN per volume via the
+  DiskAutoGrow=true tag, and bounded by a size ceiling.
+
+assumeRole: '{{ AutomationAssumeRole }}'
+
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: Role with DescribeVolumes / CreateSnapshot / ModifyVolume.
+  InstanceId:
+    type: String
+    description: Instance whose filesystem breached.
+    allowedPattern: '^i-[a-f0-9]{8,17}$'
+  MountPath:
+    type: String
+    description: >-
+      Breaching mount path. LOAD-BEARING on multi-volume hosts: it is resolved
+      host-side (findmnt/lsblk/NVMe serial) to decide WHICH volume to grow.
+      Passing the wrong path grows the wrong volume, irreversibly.
+    default: /
+  GrowthPercent:
+    type: Integer
+    description: Percentage to grow by, subject to MinGrowthGiB and MaxVolumeSizeGiB.
+    default: 20
+    allowedPattern: '^([1-9]|[1-9][0-9]|100)$'
+  MinGrowthGiB:
+    type: Integer
+    description: Floor for growth, so small volumes still gain useful headroom.
+    default: 10
+  MaxVolumeSizeGiB:
+    type: Integer
+    description: Ceiling. Growth is irreversible, so this bound is load-bearing.
+    default: 1000
+  SnsTopicArn:
+    type: String
+    description: Topic for the outcome notification.
+  DryRun:
+    type: String
+    description: >-
+      When true, evaluate guards and report the intended change without modifying
+      anything. Default true — irreversible actions should be opt-in per run.
+
+      ==> CONSEQUENCE THE CALLER MUST HANDLE: because this defaults to 'true', an
+      invoker that omits the parameter gets a runbook that evaluates every guard,
+      reports what it WOULD do, and changes nothing. That is the right default for a
+      document a human might invoke to see what it does, but it means the automated
+      path MUST pass DryRun: 'false' EXPLICITLY or remediation is permanently inert
+      while appearing to succeed. See docs/07 Phase 7 — deploy with the default first,
+      confirm the decision in the output, then switch the caller to 'false'.
+    default: 'true'
+    allowedValues: ['true', 'false']
+
+outputs:
+  - EvaluateAndGrow.Payload
+
+mainSteps:
+
+  # ==========================================================================
+  # Resolve instance + mount -> volume, evaluate every guard, then act.
+  #
+  # Implemented as one aws:executeScript step so the guards and the modification
+  # share a single view of state. Splitting them would risk acting on stale data:
+  # the 6-hour and 4-per-24h checks must reflect the moment of modification, not
+  # a moment several steps earlier.
+  # ==========================================================================
+  - name: EvaluateAndGrow
+    action: aws:executeScript
+    timeoutSeconds: 600
+    onFailure: step:NotifyFailure
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        MountPath: '{{ MountPath }}'
+        GrowthPercent: '{{ GrowthPercent }}'
+        MinGrowthGiB: '{{ MinGrowthGiB }}'
+        MaxVolumeSizeGiB: '{{ MaxVolumeSizeGiB }}'
+        DryRun: '{{ DryRun }}'
+      Script: |
+        import shlex
+        import time
+        from datetime import datetime, timedelta, timezone
+
+        import boto3
+
+        ec2 = boto3.client('ec2')
+        # Used to resolve mount -> device -> volume id ON THE HOST. EC2 cannot do this
+        # mapping: DescribeVolumes reports the attachment device name, which need not
+        # match what the guest OS presents (NVMe renames it).
+        ssm = boto3.client('ssm')
+
+        # AWS-enforced limit: 4 modifications per rolling 24h per volume, which also
+        # acts as a circuit breaker on a runaway loop.
+        #
+        # THERE IS NO MINIMUM COOLDOWN. An earlier version enforced 6 hours between
+        # modifications, citing it as an AWS constraint. AWS requires only that the
+        # previous modification reach `completed` (checked below); the Storage Blog
+        # states a new modification is allowed immediately after the previous one
+        # completes. The 6-hour figure came from a stale re:Post article — elsewhere in
+        # AWS docs "six hours" is how long a 1-TiB modification TAKES, not a wait.
+        # Re-adding it would refuse legitimate remediation for 6h after a growth.
+        MAX_MODS_PER_24H = 4
+
+        # Belt-and-braces: attachment device names that would indicate a non-EBS device.
+        # describe_volumes should never return one (the instance-store case is caught by
+        # the empty-volume check below), so this guard is expected never to fire.
+        UNSUPPORTED_DEVICES = ('ephemeral', 'instance-store')
+
+        def handler(events, context):
+            iid = events['InstanceId']
+            mount = events['MountPath']
+            dry_run = str(events['DryRun']).lower() == 'true'
+            growth_pct = int(events['GrowthPercent'])
+            min_growth = int(events['MinGrowthGiB'])
+            max_size = int(events['MaxVolumeSizeGiB'])
+
+            result = {'instance_id': iid, 'mount': mount, 'dry_run': dry_run,
+                      'action': 'none', 'checks': [], 'volume_id': None}
+
+            # ---- Resolve the volume --------------------------------------
+            vols = ec2.describe_volumes(
+                Filters=[{'Name': 'attachment.instance-id', 'Values': [iid]}]
+            ).get('Volumes', [])
+
+            if not vols:
+                result['action'] = 'aborted'
+                result['checks'].append('no EBS volumes attached (instance store?)')
+                return result
+
+            # ---- Select the volume backing `mount` -----------------------
+            # A multi-volume host is the NORMAL case (the `path` dimension, the /var
+            # example, separate data volumes). An earlier version aborted on
+            # len(vols) > 1, so a plain root + data volume could never be remediated.
+            # MountPath is what disambiguates, and resolution must run ON THE HOST:
+            # findmnt gives the mount's source device, lsblk resolves a partition back
+            # to its parent disk, and the NVMe serial encodes the volume id
+            # ("vol0abc..." -> "vol-0abc...").
+            if len(vols) == 1:
+                vol = vols[0]
+                result['checks'].append(
+                    f"single attached volume {vol['VolumeId']} — no mount resolution needed"
+                )
+            else:
+                target_vid = None
+                try:
+                    cmd = (
+                        "set -e; "
+                        f"SRC=$(findmnt -n -o SOURCE --target {shlex.quote(mount)}); "
+                        'DISK=$(lsblk -no pkname "$SRC" 2>/dev/null | head -1); '
+                        '[ -n "$DISK" ] || DISK=$(basename "$SRC"); '
+                        # ebsnvme-id is AWS-provided and reports the volume id directly.
+                        # /sys/block/$DISK/serial returns EMPTY on AL2023 (verified live),
+                        # and nvme-cli is not installed — so neither is usable.
+                        '/sbin/ebsnvme-id "/dev/$DISK" 2>/dev/null | sed -n "s/^Volume ID: *//p" || '
+                        # Fallback: the NVMe CONTROLLER serial (not /sys/block).
+                        'cat /sys/class/nvme/$(echo $DISK | sed "s/n[0-9]*$//")/serial 2>/dev/null | tr -d " "'
+                    )
+                    inv = ssm.send_command(
+                        InstanceIds=[iid],
+                        DocumentName='AWS-RunShellScript',
+                        Parameters={'commands': [cmd]},
+                        TimeoutSeconds=120,
+                    )
+                    cid = inv['Command']['CommandId']
+                    for _ in range(30):
+                        time.sleep(2)
+                        got = ssm.get_command_invocation(
+                            CommandId=cid, InstanceId=iid
+                        )
+                        if got['Status'] in ('Success', 'Failed', 'Cancelled',
+                                             'TimedOut'):
+                            break
+                    if got['Status'] == 'Success':
+                        # "vol0abc123..." -> "vol-0abc123..."
+                        serial = got['StandardOutputContent'].strip()
+                        if serial.startswith('vol') and not serial.startswith('vol-'):
+                            serial = 'vol-' + serial[3:]
+                        for v in vols:
+                            if v['VolumeId'] == serial:
+                                target_vid = serial
+                                break
+                except Exception as exc:                       # noqa: BLE001
+                    result['checks'].append(f'mount resolution failed: {exc}')
+
+                if not target_vid:
+                    # Could not prove which volume backs the mount. Growing the wrong
+                    # one is IRREVERSIBLE, so abort rather than guess — this is the
+                    # genuine LVM/RAID/unresolvable case the old check was aiming at.
+                    result['action'] = 'aborted'
+                    result['checks'].append(
+                        f'{len(vols)} volumes attached and could not resolve which one '
+                        f'backs {mount} (LVM/RAID, or the host was unreachable). '
+                        f'Human decision required — growth is irreversible.'
+                    )
+                    result['candidate_volumes'] = [v['VolumeId'] for v in vols]
+                    return result
+
+                vol = next(v for v in vols if v['VolumeId'] == target_vid)
+                result['checks'].append(
+                    f'resolved {mount} -> {target_vid} of '
+                    f'{len(vols)} attached volumes'
+                )
+            vid = vol['VolumeId']
+            size = vol['Size']
+            result['volume_id'] = vid
+            result['current_size_gib'] = size
+
+            tags = {t['Key']: t['Value'] for t in vol.get('Tags', [])}
+
+            # ---- Guard: explicit opt-in ----------------------------------
+            # Growth is irreversible, so it must never be implicit.
+            if tags.get('DiskAutoGrow') != 'true':
+                result['action'] = 'skipped'
+                result['checks'].append(
+                    'DiskAutoGrow!=true — auto-growth not enabled for this volume'
+                )
+                return result
+            result['checks'].append('opt-in tag present')
+
+            # ---- Guard: unsupported device types -------------------------
+            # Single-attach assumption: index 0 is this instance. Match on
+            # att['InstanceId'] == iid if Multi-Attach volumes enter scope.
+            device = (vol.get('Attachments') or [{}])[0].get('Device', '')
+            if any(u in device.lower() for u in UNSUPPORTED_DEVICES):
+                result['action'] = 'aborted'
+                result['checks'].append(f'unsupported device type: {device}')
+                return result
+
+            # ---- Guard: size ceiling ------------------------------------
+            if size >= max_size:
+                result['action'] = 'skipped'
+                result['checks'].append(
+                    f'already at/above ceiling ({size} >= {max_size} GiB)'
+                )
+                return result
+            result['checks'].append(f'below size ceiling ({size} < {max_size} GiB)')
+
+            # ---- Guard: modification history ----------------------------
+            # Attempting a modification too soon fails the API call; checking
+            # first turns that into a clean, explainable skip.
+            mods = ec2.describe_volumes_modifications(
+                VolumeIds=[vid]
+            ).get('VolumesModifications', [])
+
+            now = datetime.now(timezone.utc)
+            recent_24h = 0
+            for m in mods:
+                start = m.get('StartTime')
+                if not start:
+                    continue
+                age = now - start
+                if age < timedelta(hours=24):
+                    recent_24h += 1
+                # Sequential-only: an in-flight modification blocks another. This is the
+                # real history guard, and it was previously UNREACHABLE — any in-flight
+                # modification is also less than 6h old, so the deleted cooldown branch
+                # always returned first.
+                if m.get('ModificationState') in ('modifying', 'optimizing'):
+                    result['action'] = 'skipped'
+                    result['checks'].append(
+                        f"modification in progress ({m['ModificationState']})"
+                    )
+                    return result
+
+            if recent_24h >= MAX_MODS_PER_24H:
+                result['action'] = 'skipped'
+                result['checks'].append(
+                    f'{recent_24h} modifications in last 24h — AWS limit is '
+                    f'{MAX_MODS_PER_24H} (acts as a circuit breaker)'
+                )
+                return result
+            result['checks'].append(f'{recent_24h} modification(s) in last 24h — within limit')
+
+            # ---- Compute the new size ------------------------------------
+            growth = max(int(size * growth_pct / 100), min_growth)
+            new_size = min(size + growth, max_size)
+            result['target_size_gib'] = new_size
+
+            if dry_run:
+                result['action'] = 'dry_run'
+                result['checks'].append(
+                    f'DRY RUN — would grow {vid} from {size} to {new_size} GiB'
+                )
+                return result
+
+            # ---- Snapshot BEFORE modifying -------------------------------
+            # AWS's documented best practice, and the only rollback that exists,
+            # because volumes cannot be shrunk.
+            snap = ec2.create_snapshot(
+                VolumeId=vid,
+                Description=f'Pre-growth snapshot for {iid} {mount} (disk-monitoring)',
+                TagSpecifications=[{
+                    'ResourceType': 'snapshot',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': f'disk-monitoring-pre-growth-{vid}'},
+                        {'Key': 'Project', 'Value': 'disk-monitoring'},
+                        {'Key': 'SourceInstance', 'Value': iid},
+                        {'Key': 'MountPath', 'Value': mount},
+                    ],
+                }],
+            )
+            result['snapshot_id'] = snap['SnapshotId']
+            result['checks'].append(f"snapshot {snap['SnapshotId']} created")
+
+            # ---- Grow ----------------------------------------------------
+            ec2.modify_volume(VolumeId=vid, Size=new_size)
+            result['action'] = 'grown'
+            result['checks'].append(f'ModifyVolume issued: {size} -> {new_size} GiB')
+
+            # Record on the volume so repeated growth is visible — repeated
+            # expansion of one volume is the signal an application leak needs
+            # fixing rather than feeding.
+            ec2.create_tags(Resources=[vid], Tags=[
+                {'Key': 'LastAutoGrowth', 'Value': now.isoformat()},
+                {'Key': 'LastAutoGrowthSize', 'Value': str(new_size)},
+            ])
+
+            result['filesystem_warning'] = (
+                'Volume grown, but the FILESYSTEM IS NOT YET EXTENDED. The new '
+                'space is not usable by the OS until growpart + '
+                'resize2fs/xfs_growfs are run on the host.'
+            )
+            return result
+
+  - name: NotifyOutcome
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: '{{ SnsTopicArn }}'
+      Subject: 'Disk remediation: {{ InstanceId }}'
+      Message: |
+        Disk remediation runbook FINISHED for {{ InstanceId }} ({{ MountPath }}).
+
+        The `action` field below is authoritative — it may be none, skipped,
+        aborted, dry_run or grown. "Finished" does not mean anything changed.
+
+        {{ EvaluateAndGrow.Payload }}
+
+        IMPORTANT: if action was "grown", the VOLUME was enlarged but the
+        FILESYSTEM has not been extended. Run growpart and
+        resize2fs/xfs_growfs on the host before the space becomes usable.
+
+  - name: NotifyFailure
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: '{{ SnsTopicArn }}'
+      Subject: 'Disk remediation FAILED: {{ InstanceId }}'
+      Message: |
+        Automatic disk remediation FAILED for {{ InstanceId }} ({{ MountPath }}).
+
+        Manual intervention required. Check the Automation execution history for
+        details. The filesystem is still breaching its threshold.

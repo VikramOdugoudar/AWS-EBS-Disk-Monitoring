@@ -1,0 +1,44 @@
+{#
+  CloudWatch agent configuration — rendered per host.
+
+  `resources` is computed in tasks/main.yml (the cost control); this file only
+  renders it. Never ["*"]: on a container host that is one metric per overlay
+  filesystem, ~11x the bill, silently. Cost detail: docs/06.
+
+  Environment MUST live inside the `disk` section, not at `metrics` level: AWS supports
+  only ImageId/InstanceId/InstanceType/AutoScalingGroupName there and SILENTLY DROPS
+  anything else. Verified live.
+
+  DIMENSION CONTRACT (Step 3 <-> Step 4): the dimensions emitted here must match
+  the alarm's SCHEMA() clause exactly. Currently: InstanceId, path, Environment, fstype
+  (`path` AND `fstype` are added automatically by the disk section — drop_device
+  removes `device` only, confirmed against a live instance during the pilot). Changing
+  `append_dimensions` REQUIRES changing cloudformation/20-alarms-dashboard.yaml, or the
+  alarm matches nothing and sits in INSUFFICIENT_DATA — looking calm while monitoring nothing.
+#}
+{
+  "agent": {
+    "metrics_collection_interval": {{ cw_agent_collection_interval }},
+    "run_as_user": "{{ cw_agent_run_as_user }}"
+  },
+  "metrics": {
+    "namespace": "{{ cw_agent_namespace }}",
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "disk": {
+        "measurement": [
+          "used_percent"
+        ],
+        "metrics_collection_interval": {{ cw_agent_collection_interval }},
+        "drop_device": true,
+        "ignore_file_system_types": {{ cw_agent_ignore_fstypes | to_json }},
+        "resources": {{ cw_agent_monitored_mounts | to_json }},
+        "append_dimensions": {
+          "Environment": "{{ cw_agent_environment }}"
+        }
+      }
+    }
+  }
+}

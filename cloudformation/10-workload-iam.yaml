@@ -1,0 +1,467 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — per-workload-account IAM, enrollment and telemetry sharing.
+  Deployed as a SERVICE_MANAGED StackSet with AutoDeployment to an OU.
+
+  WHY THIS IS SEPARATE FROM THE ENDPOINTS TEMPLATE
+  Every parameter here holds the SAME VALUE in every account, so this stack auto-deploys
+  to an OU with no per-account input: onboarding is one action, move the account in.
+  VPC endpoints cannot work that way — see 11-workload-endpoints.yaml for why.
+
+Parameters:
+  MonitoringAccountId:
+    Type: String
+    Description: Account ID of the monitoring account (hosts the controller and OAM sink).
+    AllowedPattern: '^[0-9]{12}$'
+
+  MonitoringSinkArn:
+    Type: String
+    Description: OAM sink ARN from 00-monitoring-account.yaml (SinkArn output).
+
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID, used to scope cross-account role trust.
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+
+Resources:
+
+  # ===========================================================================
+  # 1. INSTANCE IDENTITY
+  #
+  # ONE profile serves unlimited instances (one-to-many), so there is no
+  # per-instance IAM object. The quota is one profile PER INSTANCE, which is why a
+  # single profile carries both policies rather than having separate ones.
+  #
+  # DHMC was considered and rejected: instance profiles take PRECEDENCE over it
+  # ("SSM Agent attempts to use instance profile permissions before ..."), so the
+  # two conflict rather than compose. See docs/01-access-management.md.
+  # ===========================================================================
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringInstanceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # This is what makes the instance reachable by Ansible at all.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # Lets the CloudWatch agent call PutMetricData — the actual data path.
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      # Standardized name so launch templates and Config remediation can reference
+      # it without per-account lookups.
+      InstanceProfileName: DiskMonitoringInstanceProfile
+      Roles:
+        - !Ref InstanceRole
+
+  # ===========================================================================
+  # 2. CROSS-ACCOUNT ROLES FOR THE MONITORING ACCOUNT
+  #
+  # Trust is scoped with aws:PrincipalOrgID — enforced by AWS from org membership,
+  # rather than sts:ExternalId, whose confused-deputy threat model needs a third
+  # party that does not exist inside one org. See docs/01-access-management.md.
+  # ===========================================================================
+  InventoryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringInventoryRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${MonitoringAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      Policies:
+        - PolicyName: DynamicInventoryRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read-only: what amazon.aws.aws_ec2 needs to build inventory.
+              # scripts/render_inventory.sh points one inventory file per account at
+              # this role.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - ec2:DescribeRegions
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  # ---------------------------------------------------------------------------
+  # SESSION ROLE — what Ansible's CONNECTION assumes.
+  #
+  # Separate from InventoryRole deliberately: inventory needs ec2:Describe* and the
+  # connection needs ssm:StartSession, so neither carries the other's privileges.
+  #
+  # WHY IT IS REQUIRED. The aws_ssm connection plugin has no assume_role_arn option,
+  # so site.yml's pre_tasks assume this role on the controller and inject the STS
+  # credentials as ansible_aws_ssm_* hostvars. Without it every task fails
+  # AccessDeniedException while AWS Config still reports COMPLIANT — nothing
+  # surfaces it.
+  # ---------------------------------------------------------------------------
+  SessionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringSessionRole
+      # 1 hour. pre_tasks re-assumes per `serial` batch, so this bounds a batch
+      # rather than a whole run — see the note in ansible/group_vars/all.yml.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${MonitoringAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      Policies:
+        - PolicyName: SessionManagerConnect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # THE TAG CONDITION IS THE CONTROL. Without it this role could open
+              # a root shell on ANY instance in the account. Scoped to the
+              # monitored fleet, it can only reach what it is meant to configure
+              # — and un-tagging an instance revokes access as a side effect.
+              - Effect: Allow
+                Action:
+                  - ssm:StartSession
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/DiskMonitoring: enabled
+              # SSM-SessionManagerRunShell is the DEFAULT session document, and the
+              # aws_ssm plugin calls StartSession without a DocumentName — so this must
+              # name that document, NOT AWS-StartSSHSession (the SSH-over-SSM path,
+              # which this design does not use).
+              - Effect: Allow
+                Action:
+                  - ssm:StartSession
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}::document/SSM-SessionManagerRunShell'
+              # Session teardown and status. These act on sessions, not instances, so the
+              # tag condition above cannot apply.
+              #
+              # ⚠️ session/* is EVERY session in the account, including an operator's.
+              # Scope to this principal's own with session/${!aws:userid}-* before
+              # treating this as least-privilege.
+              - Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:session/*'
+              # Read-only reachability checks the plugin and operators both use.
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeSessions
+                  - ssm:GetConnectionStatus
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  ReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringReadRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${MonitoringAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      Policies:
+        - PolicyName: EnrichmentAndRemediation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DescribeVolumes is what lets the enrichment Lambda answer "which EBS
+              # volume is mounted on that path?" — VolumeId can NEVER be a metric
+              # dimension, because the agent runs in the OS and has no concept of an
+              # EBS volume.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumesModifications
+                  - ec2:DescribeSnapshots
+                Resource: '*'
+              # Remediation: snapshot then grow. Snapshot first is the only rollback
+              # that exists, because EBS volumes CANNOT be shrunk.
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:ModifyVolume
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    # Opt-in only. Growing a volume is irreversible, so it must never
+                    # be fleet-wide by default.
+                    aws:ResourceTag/DiskAutoGrow: 'true'
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: disk-monitoring
+
+  # ===========================================================================
+  # 3. OAM LINK — shares metrics with the monitoring account. The sink policy and the
+  # free/no-data-movement rationale live at the sink in 00-monitoring-account.yaml.
+  #
+  # NOT retroactive — sharing starts at link creation.
+  #
+  # ⚠️ No LinkConfiguration.MetricConfiguration.Filter is set, so this shares ALL
+  # metrics rather than only CWAgent as docs/04 claims. Namespace filtering is a LINK
+  # property; the sink's oam:ResourceTypes is resource-TYPE scoping and cannot do it.
+  # ===========================================================================
+  MonitoringLink:
+    Type: AWS::Oam::Link
+    Properties:
+      SinkIdentifier: !Ref MonitoringSinkArn
+      LabelTemplate: '$AccountName'
+      ResourceTypes:
+        - AWS::CloudWatch::Metric
+      Tags:
+        Project: disk-monitoring
+
+  # ===========================================================================
+  # 4. AWS CONFIG RULES — make coverage default-on.
+  #
+  # PREREQUISITE: a Config configuration recorder must exist in this account and
+  # Region. Rules deploy successfully WITHOUT one and then silently never evaluate —
+  # see Phase 2 of docs/07-deployment.md.
+  #
+  # Both rules are change-triggered, so correction happens promptly rather than on a
+  # periodic sweep.
+  #
+  # ⚠️ REMEDIATION NEEDS CUSTOM CODE HERE. AWS states on the required-tags rule's own
+  # page: "The AWS-managed AWS Systems Manager automation document AWS-SetRequiredTags
+  # does not work as a remediation with this rule. You will need to create your own
+  # custom Systems Manager automation documentation for remediation." So the
+  # RequiredTagsRemediation below is inert as written, which also breaks the Rule 2
+  # enrollment chain. (Separately, ResourceValue: RESOURCE_ID yields a bare instance
+  # ID, not the ARN that ResourceARNs expects.) docs/05's "no custom code to write,
+  # test, or own" needs correcting alongside this.
+  # ===========================================================================
+  RequiredTagsRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: disk-monitoring-required-tags
+      Description: >-
+        Flags instances missing the DiskMonitoring tag, which is what dynamic
+        inventory filters on.
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters:
+        tag1Key: DiskMonitoring
+        tag1Value: enabled
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  RequiredTagsRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref RequiredTagsRule
+      TargetType: SSM_DOCUMENT
+      TargetId: AWS-SetRequiredTags
+      Automatic: true
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt ConfigRemediationRole.Arn
+        ResourceARNs:
+          ResourceValue:
+            Value: RESOURCE_ID
+        Tags:
+          StaticValue:
+            Values:
+              - '{"DiskMonitoring":"enabled"}'
+
+  InstanceProfileAttachedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: disk-monitoring-instance-profile-attached
+      Description: >-
+        Flags instances with no instance profile. Such an instance is not an SSM
+        managed node, so it is unreachable by Ansible even if correctly tagged —
+        profile and tag are jointly necessary, neither sufficient.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_PROFILE_ATTACHED
+      InputParameters:
+        IamInstanceProfileArnList: !GetAtt InstanceProfile.Arn
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  ConfigRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringConfigRemediationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TagAndProfileRemediation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:AssociateIamInstanceProfile
+                  - ec2:DescribeIamInstanceProfileAssociations
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt InstanceRole.Arn
+
+  # ===========================================================================
+  # 5. EVENTBRIDGE RULES 1 & 2 — event-driven enrollment.
+  #
+  # There is NO scheduled sweep, so these rules are the only enrollment path. Both
+  # forward to the monitoring account's default event bus, where the receiving rule
+  # in 00-monitoring-account.yaml runs the playbook for that instance.
+  # ===========================================================================
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DiskMonitoringEventBridgeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ForwardToMonitoringEventBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${MonitoringAccountId}:event-bus/default'
+
+  # RULE 1 — a new instance reaches "running".
+  InstanceLaunchRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disk-monitoring-instance-launch
+      Description: >-
+        Configure a newly launched instance without waiting for a periodic sweep.
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Instance State-change Notification
+        detail:
+          state:
+            - running
+      State: ENABLED
+      Targets:
+        - Id: ForwardToMonitoringAccount
+          Arn: !Sub 'arn:aws:events:${AWS::Region}:${MonitoringAccountId}:event-bus/default'
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+
+  # RULE 2 — a tag changed. REQUIRED, not optional. With no scheduled sweep, an
+  # instance tagged AFTER launch would never be configured: the launch event already
+  # fired against tag-filtered inventory and never fires again.
+  #
+  # Environment is watched because it is a METRIC DIMENSION: arriving late with no
+  # re-run leaves metrics on Environment=unscoped permanently, so the instance sits
+  # OUTSIDE its environment-scoped alarm — monitored but not covered, and it looks
+  # fine. docs/02.
+  TagChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disk-monitoring-tag-change
+      Description: >-
+        Enroll instances tagged after launch (e.g. by Config remediation), and
+        re-render config when Environment changes.
+      EventPattern:
+        source:
+          - aws.tag
+        detail-type:
+          - Tag Change on Resource
+        detail:
+          service:
+            - ec2
+          resource-type:
+            - instance
+          changed-tag-keys:
+            - DiskMonitoring
+            - Environment
+      State: ENABLED
+      Targets:
+        - Id: ForwardToMonitoringAccount
+          Arn: !Sub 'arn:aws:events:${AWS::Region}:${MonitoringAccountId}:event-bus/default'
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+
+Outputs:
+  InstanceProfileName:
+    Description: >-
+      Reference from launch templates / ASGs. Together with the DiskMonitoring tag
+      this is what makes an instance covered by construction — both are required,
+      neither alone is sufficient.
+    Value: !Ref InstanceProfile
+
+  InstanceSecurityGroupHint:
+    Description: >-
+      Pass the security group attached to monitored instances into
+      11-workload-endpoints.yaml as InstanceSecurityGroupId.
+    Value: 'See 11-workload-endpoints.yaml — endpoints need 443 inbound from this SG'
+
+  InventoryRoleArn:
+    Description: Set as assume_role_arn in this account's rendered inventory file.
+    Value: !GetAtt InventoryRole.Arn
+
+  SessionRoleArn:
+    Description: >-
+      Assumed per account by site.yml's pre_tasks to obtain the STS credentials the
+      aws_ssm connection plugin needs — see the SessionRole header.
+    Value: !GetAtt SessionRole.Arn
+
+  ReadRoleArn:
+    Description: Assumed by the enrichment Lambda and the remediation runbook.
+    Value: !GetAtt ReadRole.Arn
+
+  OamLinkArn:
+    Value: !GetAtt MonitoringLink.Arn
