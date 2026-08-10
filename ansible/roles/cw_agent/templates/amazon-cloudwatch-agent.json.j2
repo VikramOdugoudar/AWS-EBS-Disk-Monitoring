@@ -12,9 +12,9 @@
   DIMENSION CONTRACT (Step 3 <-> Step 4): the dimensions emitted here must match
   the alarm's SCHEMA() clause exactly. Currently: InstanceId, path, Environment, fstype
   (`path` AND `fstype` are added automatically by the disk section — drop_device
-  removes `device` only, confirmed against a live instance during the pilot). Changing
-  `append_dimensions` REQUIRES changing cloudformation/20-alarms-dashboard.yaml, or the
-  alarm matches nothing and sits in INSUFFICIENT_DATA — looking calm while monitoring nothing.
+  removes `device` only, verified live; see tested_findings.md 2). Changing `append_dimensions`
+  REQUIRES changing cloudformation/20-alarms-dashboard.yaml, or the alarm matches
+  nothing and sits in INSUFFICIENT_DATA — looking calm while monitoring nothing.
 #}
 {
   "agent": {

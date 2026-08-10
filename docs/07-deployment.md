@@ -67,32 +67,31 @@ turns an open question into a confirmation.
 
 ---
 
-## Phase 0 — pre-deployment validation (CI gates)
+## Phase 0 — pre-deployment validation
 
-| Gate | What it catches |
-|---|---|
-| `ansible-lint` + `yamllint` | Syntax and practice issues |
-| **Template render test** | **The ~11× cost error** — renders with fixture `ansible_mounts` and asserts valid JSON, `tmpfs` excluded, `resources` is not `["*"]` |
-| Dimension-contract test | Fails if the agent template and the alarm `SCHEMA()` drift apart — asserts the set is `{InstanceId, path, Environment, fstype}` |
-| Idempotence check | A second run must report `changed=0` |
-| `aws cloudformation validate-template` | Template errors |
-| `ansible-playbook --check --diff` | Exactly what would change, before it does |
+| Check | What it catches | How |
+|---|---|---|
+| `ansible-lint` + `yamllint` | Syntax and practice issues | tooling, no credentials needed |
+| `aws cloudformation validate-template` | Template errors | once per template |
+| `ansible-playbook --check --diff` | Exactly what would change, before it does | dry run, ideally `--limit` one host |
+| **Rendered agent config** | **The ~11× cost error** — confirm `resources` is a real mount list and never `["*"]`, and that `tmpfs` and the other pseudo-filesystems are excluded | inspect the rendered JSON on the first host |
+| **Dimension contract** | The agent template and the alarm `SCHEMA()` clause must name the same four dimensions: `InstanceId, path, Environment, fstype` | compare the two files by eye, then confirm live at Phase 6 |
+| Idempotence | Configuration drift or a non-converging task | run the playbook twice; the second run must report `changed=0` |
 
-The render test is the highest-value gate here: **a unit test that catches a cost mistake
-before it exists on a single instance.** `resources: ["*"]` looks harmless in review and
-mints one metric per overlay filesystem on a container host — the bill arrives a month
-later, and doc 04 explains that **there is no way to un-bill a metric once published.**
+**The rendered-config check is the highest-value one here.** `resources: ["*"]` looks harmless
+in review and mints one metric per overlay filesystem on a container host — the bill arrives a
+month later, and doc 04 explains that **there is no way to un-bill a metric once published.**
 
-The dimension-contract test is a close second, and its value rose sharply after the pilot:
+**The dimension contract is a close second**, and its value rose sharply after the pilot:
 because the runtime symptom of a mismatch is a **green `OK`** rather than an error
-(`tested_findings.md` §2), CI is one of only two places the failure can be detected at all.
+(`tested_findings.md` §2), this review and the Phase 6 gate below are the only two places the
+failure can be caught at all.
 
-```bash
-python3 -m unittest discover tests -v
-```
-
-This needs **no AWS credentials and no third-party dependencies**, so it runs in any CI
-image.
+⚠️ **Both are manual review steps today, not automated gates.** Adding two checks to CI — a
+template render asserting `resources` is never `["*"]`, and an assertion that the alarm
+`SCHEMA()` dimension set matches the agent's — is the highest-value hardening available for
+this repo. Both are cheap, need **no AWS credentials**, and each guards a failure mode that is
+otherwise entirely silent.
 
 ---
 
@@ -558,4 +557,3 @@ design; its lifecycle rule expires contents in a day regardless.
 - [`ansible/requirements.yml`](../ansible/requirements.yml) — Phase 4: controller-side collections and Python prerequisites
 - [`ssm-documents/DiskSpace-GrowVolume.yaml`](../ssm-documents/DiskSpace-GrowVolume.yaml) — Phase 7: guarded volume growth, `DryRun` default
 - [`lambda/enrich_disk_alarm.py`](../lambda/enrich_disk_alarm.py) — Phase 7: instance → mount → volume ID resolution, and the runbook's invoker — **required**, because the alarm supplies no `InstanceId`
-- [`tests/test_agent_config.py`](../tests/test_agent_config.py) — Phase 0: cardinality guards, dimension contract, cost projection

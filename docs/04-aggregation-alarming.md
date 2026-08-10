@@ -397,8 +397,8 @@ aws cloudwatch list-metrics --namespace CWAgent --metric-name disk_used_percent
 ```
 
 This check is not optional paranoia: **AWS docs disagree** on whether the dimension is
-`Partition` or `device` / `fstype` / `path`. The contract is enforced in CI by
-[`tests/test_agent_config.py`](../tests/test_agent_config.py).
+`Partition` or `device` / `fstype` / `path`. Nothing enforces the contract automatically, so
+the agent template and this template must be edited as a pair — see doc 03.
 
 **And the runtime failure is not the one you would expect.** A mismatch does *not* leave
 the alarm in `INSUFFICIENT_DATA`. Because this design sets `TreatMissingData:
@@ -736,4 +736,3 @@ that silently half-works is worse than one that does nothing.
 - [`cloudformation/30-dashboard.yaml`](../cloudformation/30-dashboard.yaml) — cross-account dashboard, `SORT(SEARCH(...))` widgets, coverage note
 - [`lambda/enrich_disk_alarm.py`](../lambda/enrich_disk_alarm.py) — re-query with `path`, cross-account `DescribeVolumes`, enriched notification
 - [`ssm-documents/DiskSpace-GrowVolume.yaml`](../ssm-documents/DiskSpace-GrowVolume.yaml) — guards, pre-growth snapshot, `ModifyVolume`, outcome notification
-- [`tests/test_agent_config.py`](../tests/test_agent_config.py) — enforces the Step 3 ↔ Step 4 dimension contract

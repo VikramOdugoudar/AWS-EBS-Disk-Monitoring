@@ -252,11 +252,10 @@ chosen for.
 
 ---
 
-## Cost is verified in CI
+## Projecting the cost before deploying
 
-`tests/test_agent_config.py` includes a `TestCostProjection` class that computes the
-**tiered** cost for the current mount-selection logic and prints both the projection and
-the wildcard ratio, failing if the projection exceeds the expected envelope:
+The tiered projection for the current mount-selection logic, and the ratio against the
+wildcard, are worth computing before a rollout and again whenever the fstype filter changes:
 
 ```
 1,000 instances x 3 mounts = 3,000 metrics
@@ -264,10 +263,14 @@ Projected monthly cost (metrics + 2 alarms): $1,500
 resources:['*'] on container hosts would cost 11.3x more ($17,000 vs $1,500)
 ```
 
-The projection runs against the same `select_mounts()` logic the Jinja template uses, so
-loosening the fstype filter moves the number. **A cardinality regression is caught before
-it reaches a single instance**, not a month later on the bill — which is the only point at
-which it is cheap to catch.
+The number moves with the fstype filter, which is why the filter is the thing to review. A
+cardinality regression caught here costs nothing; the same regression caught on the invoice is
+already 15 months of committed billing (see *The expensive mistake avoided* above).
+
+⚠️ **This is currently a manual calculation.** Automating it — asserting the projected metric
+count for a fixture host stays inside an expected envelope — would catch a cost regression
+before it reached a single instance, and is worth doing alongside the dimension-contract check
+in doc 03.
 
 ---
 
@@ -299,4 +302,3 @@ absolute rates, because they derive from the same price list.
 - [`ansible/roles/cw_agent/templates/amazon-cloudwatch-agent.json.j2`](../ansible/roles/cw_agent/templates/amazon-cloudwatch-agent.json.j2) — where the cost control lives: `resources`, `ignore_file_system_types`, `drop_device`
 - [`ansible/roles/cw_agent/defaults/main.yml`](../ansible/roles/cw_agent/defaults/main.yml) — the fstype allowlist/denylist that sets cardinality
 - [`cloudformation/20-alarms-dashboard.yaml`](../cloudformation/20-alarms-dashboard.yaml) — two Metrics Insights alarms; scope partitioning determines alarm spend
-- [`tests/test_agent_config.py`](../tests/test_agent_config.py) — `TestCardinalityGuards` and `TestCostProjection`

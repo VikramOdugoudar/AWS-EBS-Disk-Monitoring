@@ -41,8 +41,8 @@ instances (one-to-many), so there is no per-instance IAM object; the quota is **
 ⟲ **The reversal:** DHMC was first rejected because it requires IMDSv2 and an M&A estate holds
 IMDSv1 instances, making migration a prerequisite. Once IMDSv2 became a stated assumption that
 objection vanished, so it was re-examined — and rejected again for the stronger reason above.
-An earlier version of this design assumed *"DHMC grants SSM permissions regardless of an existing
-role"*; the docs say the opposite.
+An earlier claim of mine that *"DHMC grants SSM permissions regardless of an existing role"* was
+**wrong**; the docs say the opposite.
 
 ---
 
@@ -77,11 +77,11 @@ enumerated at runtime via `organizations:ListAccounts`.
 | **Ansible as the metrics collector** (run `df` on a schedule and publish) | Ansible runs at intervals; the agent runs continuously. A scheduled tool produces datapoints only when it runs, so a disk filling between runs is invisible. Confirming evidence: **there is no Ansible module for `cloudwatch:PutMetricData`** in `amazon.aws`, `community.aws`, or `amazon.cloud` — it would have to shell out to the CLI on every host on every run. Ansible was never intended as a metrics pipeline. |
 | **Native SSM documents only, no Ansible** (`AWS-ConfigureAWSPackage` + `AmazonCloudWatch-ManageAgent`) | Simplest possible design and fully AWS-maintained. Loses **fact-driven mount enumeration**: Parameter Store holds a *static* config, so you would need one config per host shape or fall back to `resources: ["*"]` and pay ~11× the metric cost. Also does not satisfy the brief's request for Ansible artifacts. |
 
-⟲ **The reversal:** on-node was chosen first, then reversed. Two objections were overstated and
-corrected in the second pass: the controller is **not a SPOF for monitoring** (it is not in the
-data path — if it is down, configuration cannot be deployed, but the agent keeps publishing,
-alarms keep evaluating, remediation keeps working), and enrollment latency is a **scheduled-run
-delay, not a monitoring gap**.
+⟲ **The reversal:** on-node was chosen first, then reversed. Two objections I had overstated
+and corrected: the controller is **not a SPOF for monitoring** (it is not in the data path — if
+it is down, configuration cannot be deployed, but the agent keeps publishing, alarms keep
+evaluating, remediation keeps working), and enrollment latency is a **scheduled-run delay, not a
+monitoring gap**.
 
 ---
 
@@ -134,7 +134,7 @@ copies, so there is no pipeline to fall behind or backfill.
 
 | Rejected | Why |
 |---|---|
-| **CloudWatch Metrics Centralization** (org rules that physically replicate metrics; GA June 2026) | **Deciding factor:** *"all metrics from source accounts are centralized. Selective metric filtering is not supported at this time."* We could not scope to `CWAgent`, so **every** custom/EMF/OTLP metric in every account would replicate — with destination metric-quota risk from metrics unrelated to this project. It also **excludes AWS service metrics** (no `AWS/EC2`, `AWS/EBS`), so central correlation of CPU or EBS I/O alongside disk is impossible. Its headline advantage — cross-Region — is unused at single-Region scope. Heavier governance (Organizations trusted access + a service-linked role from the management/delegated-admin account), very new, and replication is a pipeline to watch. **It becomes the right answer for multi-Region.** See `docs/08-alternative-centralization.md` for the full evaluation. |
+| **CloudWatch Metrics Centralization** (org rules that physically replicate metrics; GA June 2026) | **Deciding factor:** *"all metrics from source accounts are centralized. Selective metric filtering is not supported at this time."* We could not scope to `CWAgent`, so **every** custom/EMF/OTLP metric in every account would replicate — with destination metric-quota risk from metrics unrelated to this project. It also **excludes AWS service metrics** (no `AWS/EC2`, `AWS/EBS`), so central correlation of CPU or EBS I/O alongside disk is impossible. Its headline advantage — cross-Region — is unused at single-Region scope. Heavier governance (Organizations trusted access + a service-linked role from the management/delegated-admin account), very new, and replication is a pipeline to watch. **It becomes the right answer for multi-Region.** |
 | **Cross-account metric push** (instances call `PutMetricData` into the monitoring account) | **Blast-radius inversion** — every instance in every account would hold credentials to write into central monitoring, so one compromised host can flood or poison monitoring for the entire estate, and **monitoring data is exactly what an attacker wants to suppress**. Also loses local visibility (account owners could not see their own instances), and destroys trustworthy attribution: with OAM `AWS.AccountId` is applied by AWS, whereas here it would be a dimension the *instance* sets and therefore spoofable. Contradicts the whole model of instances holding minimal, local permissions. |
 | **Metric streams → Firehose → S3/OpenSearch/third-party** | Costs per metric update **plus** per-GB Firehose **plus** destination storage, where OAM is free. You own the pipeline (delivery failures, buffering, retries, backfill) and rebuild alarming in the destination. Right only for retention beyond CloudWatch's 15 months or non-AWS correlation. |
 | **Per-account alarms only** (each account alarms into a shared SNS topic) | Sidesteps the metric ceiling, but gives alerts with **no unified view** — failing the brief's "centralize and present" — multiplies alarm management by N accounts, and permits no cross-account ranking. A reasonable *complement*, not a replacement. |
@@ -156,8 +156,8 @@ instance needs no alarm created.
 | **Metric math** | *"Alarms based on metric math expressions can reference a maximum of 10 metrics. This is a hard limit that cannot be increased."* Ten metrics is about three instances. |
 | **`AVG` as the statistic** | Hides the failure it is meant to catch: 999 hosts at 20% plus one at 100% averages to ~20% and never fires. A single host with mounts at 45/94/20% averages to 53%, under an 80% threshold while a filesystem is nearly full. **`MAX` always.** |
 | **Fleet-wide alarms instead of per-account-per-environment** ⟲ | A single global threshold is either too noisy for dev or too late for prod. Granularity is **free** — billing follows what the filter *matches* — so partitioning costs nothing and enables differentiated thresholds plus per-team routing. |
-| **Grouping by mount rather than instance** | 3,000 contributors at 1,000 VMs **exceeds the 500-series return cap**, so `ORDER BY` would silently decide which are evaluated. Grouping by instance gives 1,000 contributors, comfortably inside it; the mount detail is recovered by the dashboard and the enrichment Lambda. **Vindicated live**: on 2 hosts with 6 filesystems, `GROUP BY InstanceId` gave 2 contributors and `GROUP BY InstanceId, path` gave 6 — and **both named the instance equally: not at all.** Finer grouping triples the contributor count and returns nothing operationally, because identity lives in the query *result*, never in the alarm. |
-| **Filesystem UUID as a dimension** | `device` names (`nvme1n1`) do shift across reboots, but `drop_device: true` already removes that dependency — **and only that one**: it removes `device`, *not* `fstype`, so the emitted set is `InstanceId, path, Environment, fstype`, confirmed against a live instance during the pilot. A UUID changes on every reformat or instance replacement, creating a **brand-new billable metric** each time while the old one lingers — under immutable infrastructure abandoned metrics accumulate and are all billed. Also unreadable alerts, and **an extra, unstable member of `SCHEMA()`'s exact-set match** — which the pilot showed is unforgiving: one wrong dimension matches nothing and the alarm reports green `OK` forever. **The framing:** a UUID answers *"is this the same physical filesystem?"* while disk monitoring asks *"is the thing my application writes to running out of space?"* — a **mount-point** question. |
+| **Grouping by mount rather than instance** | 3,000 contributors at 1,000 VMs **exceeds the 500-series return cap**, so `ORDER BY` would silently decide which are evaluated. Grouping by instance gives 1,000 contributors, comfortably inside it; the mount detail is recovered by the dashboard and the enrichment Lambda. **Vindicated live** [`tested_findings.md §3`]: on 2 hosts with 6 filesystems, `GROUP BY InstanceId` gave 2 contributors and `GROUP BY InstanceId, path` gave 6 — and **both named the instance equally: not at all.** Finer grouping triples the contributor count and returns nothing operationally, because identity lives in the query *result*, never in the alarm. |
+| **Filesystem UUID as a dimension** | `device` names (`nvme1n1`) do shift across reboots, but `drop_device: true` already removes that dependency — **and only that one**: it removes `device`, *not* `fstype`, so the emitted set is `InstanceId, path, Environment, fstype` [verified live, `tested_findings.md §2`]. A UUID changes on every reformat or instance replacement, creating a **brand-new billable metric** each time while the old one lingers — under immutable infrastructure abandoned metrics accumulate and are all billed. Also unreadable alerts, and **an extra, unstable member of `SCHEMA()`'s exact-set match** — which the pilot showed is unforgiving: one wrong dimension matches nothing and the alarm reports green `OK` forever. **The framing:** a UUID answers *"is this the same physical filesystem?"* while disk monitoring asks *"is the thing my application writes to running out of space?"* — a **mount-point** question. |
 | **EBS `VolumeId` as a dimension** | **No fullness metric exists** — `AWS/EBS` is entirely I/O. The agent runs in the OS and has no concept of `vol-xxx`. And the mapping is not 1:1: LVM/RAID means many volumes → one filesystem, partitioning means one volume → many filesystems, instance store has no `vol-` id, tmpfs has no volume at all. |
 | **Per-application scoping via resource tags** | **`WHERE tag.X` does not work for `CWAgent`.** CloudWatch's tag-enrichment covers only an allowlist (~70 `AWS/*` namespaces plus `ContainerInsights`, `Glue`, `LambdaInsights`, `CloudWatchSynthetics`), so the intuitive approach fails **silently**. Scope must be a metric *dimension* instead — which is what `Environment` is. |
 | **Per-instance alarms for granularity** | This is approach 1 again: 2,000 alarms, lifecycle churn, silent gaps. |
@@ -176,7 +176,7 @@ referenced alarms still bill.
 
 | Rejected | Why |
 |---|---|
-| **Scheduled sweep as the enrollment mechanism** ⟲ | Deferred rather than rejected outright: event-driven enrollment is faster and cheaper. But it means **a missed or failed event leaves an instance unconfigured with nothing to catch it**, and no periodic re-run means drift is neither repaired nor detected. **Reproduced live**: attaching a volume fires no event of any kind, so a volume filled to 40% on a running instance stayed unmonitored until a hand re-render. Note the sweep is **not** the only fix for that particular case — `resources: ["*"]` with a complete denylist picks up new volumes with no trigger at all (§12) — but it remains the only fix for a stopped agent or an edited config. See `limitations.md`. |
+| **Scheduled sweep as the enrollment mechanism** ⟲ | Deferred rather than rejected outright: event-driven enrollment is faster and cheaper. But it means **a missed or failed event leaves an instance unconfigured with nothing to catch it**, and no periodic re-run means drift is neither repaired nor detected. **Reproduced live** [`tested_findings.md §6`]: attaching a volume fires no event of any kind, so a volume filled to 40% on a running instance stayed unmonitored until a hand re-render. Note the sweep is **not** the only fix for that particular case — `resources: ["*"]` with a complete denylist picks up new volumes with no trigger at all (§12) — but it remains the only fix for a stopped agent or an edited config. See `limitations.md`. |
 | **Custom Lambda for tag remediation** | Only needed if the tag **value** requires logic (enable prod, skip sandbox, honour an opt-out list). `AWS-SetRequiredTags` applies a fixed value, which suits unconditional enrollment. Worth knowing: **a Config remediation action *is* an SSM Automation document**, so the "Lambda or SSM doc that tags per Config finding" pattern is exactly what this is — AWS simply ships the document. |
 | **SCP blocking untagged `RunInstances`** | Hard prevention, but it will eventually block a legitimate deployment at an inconvenient moment, and a monitoring tag is thin justification for failing a launch. **Detect-and-fix beats prevent-and-break** for a monitoring concern. |
 | **Targeting all managed nodes instead of requiring the tag** | Removes the untagged gap but gives no opt-out, runs against every node including untested ones, and a bad change hits everything at once. |
@@ -228,7 +228,7 @@ referenced alarms still bill.
 ### ⚠️ Reopened: `resources: ["*"]` is rejected for the cost, but it buys something real
 
 The live pilot found that the ~11× figure is **conditional on the denylist being complete**, and
-that the wildcard closes a gap the chosen design cannot.
+that the wildcard closes a gap the chosen design cannot [`tested_findings.md §4`, `§6`].
 
 **What it buys.** The chosen design enumerates mounts from `ansible_mounts` at *configuration*
 time, so a volume attached later is invisible until something re-runs Ansible — and nothing does
@@ -264,7 +264,7 @@ vfat  ramfs  efivarfs  pstore  bpf  selinuxfs  securityfs  hugetlbfs  rpc_pipefs
 
 Adding them (29 entries) stopped `/boot/efi` publishing. Note that this leak is **irreversible in
 billing terms** — there is no display-time filter anywhere, and a published metric is stored and
-billed for 15 months.
+billed for 15 months (`tested_findings.md §5`).
 
 **Standing decision: unchanged.** The allowlist stays, because failing closed on an unknown
 filesystem type is worth more than free drift repair, and `limitations.md §6` item 3 already
@@ -294,8 +294,8 @@ treated as a cost control that can regress.
 | Rejected | Why |
 |---|---|
 | **Dropping the dashboard, alarms only** | Considered, since the enrichment Lambda already covers incident response. Kept because it costs **$0** (first three free), answers the brief's "centralize and present" requirement, and provides the trend view that distinguishes a spike from steady growth — which changes whether you clean up or resize. |
-| **Rendered PNG/SVG diagrams as the maintainable source** | Presentation-ready, but requires mermaid-cli or Graphviz to regenerate. Mermaid renders natively in GitHub, is diffable text, and remains the maintainable source; a rendered image is embedded in the README as well. |
-| **An offline simulator** ⟲ | Would have demonstrated the logic without AWS credentials. Dropped in favour of real deployable artifacts and validation against a live account. |
+| **Rendered PNG/SVG diagrams** | Presentation-ready, but requires mermaid-cli or Graphviz to regenerate. Mermaid renders natively in GitHub and is diffable text. |
+| **An offline simulator** ⟲ | Would have demonstrated the logic without AWS credentials. Dropped in favour of real deployable artifacts; the pre-deployment test suite covers validation instead. |
 
 ---
 
@@ -309,22 +309,23 @@ treated as a cost control that can regress.
 | 4 | Per-account transfer buckets | **One central bucket** | Contents are transient; isolation bought little |
 | 5 | DHMC as an option | **Rejected outright** | Instance profiles take precedence — they conflict rather than compose |
 
-Corrections recorded because they were load-bearing to earlier reasoning:
-- *"Metrics Insights costs 2× per-VM alarms"* — **wrong**, they are identical; an earlier
-  comparison used one threshold against two.
+Corrections to my own earlier claims, recorded because they were load-bearing:
+- *"Metrics Insights costs 2× per-VM alarms"* — **wrong**, they are identical; I compared one
+  threshold against two.
 - *"Cross-Region alarming is impossible"* — **incomplete**; Metrics Centralization makes it
   possible by copying metrics into the alarm's Region.
 - *"DHMC grants SSM permissions regardless of an existing role"* — **wrong**, the opposite is true.
-- *"~8× cost for wildcard mounts"* — **~11×**; an earlier estimate omitted that alarms also bill
-  per metric analyzed.
+- *"~8× cost for wildcard mounts"* — **~11×**; I had omitted that alarms also bill per metric
+  analyzed.
 - *"`drop_device: true` removes the device-related dimensions"* — **incomplete**. It removes
   `device` and leaves `fstype`, so the emitted set has **four** members and every
-  three-dimension `SCHEMA()` clause in the repo matched nothing.
+  three-dimension `SCHEMA()` clause in the repo matched nothing [`tested_findings.md §2`].
 - *"`resources: ["*"]` is simply ~11× more expensive"* — **conditional**. It is ~11× more
   expensive *when the denylist is incomplete*; with a complete one it produces the same
   cardinality as the allowlist **and** picks up new volumes automatically (§12).
 - *"A finer `GROUP BY` would put the breaching filesystem in the alert"* — **wrong**. No grouping
-  puts identity in the alarm; the enrichment Lambda is the only path to it.
+  puts identity in the alarm; the enrichment Lambda is the only path to it
+  [`tested_findings.md §3`].
 
 ---
 
@@ -332,5 +333,5 @@ Corrections recorded because they were load-bearing to earlier reasoning:
 
 - `limitations.md` — what the current design cannot do, and deferred work
 - `quotas.md` — every AWS quota this design touches, and which ones bind
+- `context_2.md` — the full decision record with reasoning in narrative form
 - `docs/01`–`docs/07` — each decision argued in its own context
-- `docs/08-alternative-centralization.md` — evaluated-and-not-adopted alternative to the OAM aggregation layer

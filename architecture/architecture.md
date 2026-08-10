@@ -202,16 +202,16 @@ descending guarantees the fullest disks are seen.
 **The `SCHEMA()` clause names four dimensions, and the fourth is easy to miss.** The agent
 emits `InstanceId, path, Environment, fstype` — `drop_device: true` removes `device` but
 **not** `fstype`. `SCHEMA()` is an **exact-set** match, so a three-dimension clause matches
-nothing at all. Confirmed against a live instance during the pilot: the three-dimension form
-returned *"No time series were returned by the query"* while the four-dimension form evaluated
-normally on the same data. Worse, with `TreatMissingData: notBreaching` a zero-match query
+nothing at all. Verified live: the three-dimension form returned *"No time series were
+returned by the query"* while the four-dimension form evaluated normally on the same data
+(`tested_findings.md §2`). Worse, with `TreatMissingData: notBreaching` a zero-match query
 reports a reassuring green **`OK` forever** rather than `INSUFFICIENT_DATA`, so
 `InsufficientDataActions` never fires and the mismatch is completely silent.
 
 **The alarm names no instance, at any grouping.** A firing fleet alarm carries only
 *"1 out of 7 time series evaluated to ALARM"* and an empty `StateReasonData` — adding `path`
 to `GROUP BY` does not change that, because the identity lives in the query **result**, never
-in the alarm. The enrichment Lambda above is therefore the **only**
+in the alarm (`tested_findings.md §3`). The enrichment Lambda above is therefore the **only**
 path from "something breached" to "this volume needs growing" — **mandatory, not an
 enhancement.**
 
@@ -230,17 +230,17 @@ flowchart LR
 
 `metrics_collection_interval: 60` costs the same as 300 — **frequency is free.** Only
 unique dimension combinations are billed. That single `fstype` filter in the Jinja
-template is the cost control, guarded by the cardinality checks in `ansible/roles/cw_agent`.
+template is the cost control.
 
 **And it is the only cost control there is, because nothing downstream can undo it.** Once
 published, a metric is stored and billed for **15 months**; neither CloudWatch nor OAM can
 un-bill it, OAM filters by resource *type* rather than namespace, and `WHERE fstype='xfs'`
-hides junk from **view** only. Filtering has to happen on the host
+hides junk from **view** only (`tested_findings.md §5`). Filtering has to happen on the host
 or not at all.
 
 The cardinality model itself is now observed rather than modelled: 2 instances × 2 mounts
 produced **exactly 4 metrics**, and the metric tracked filesystem reality — writing 6 GiB
-moved `/data` from 1.02% to 61.40% while on-host `df` read 62%.
+moved `/data` from 1.02% to 61.40% while on-host `df` read 62% (`tested_findings.md §1`).
 
 ---
 
@@ -266,10 +266,10 @@ moved `/data` from 1.02% to 61.40% while on-host `df` read 62%.
 2. **Config verifies configuration, not outcome.** An instance whose agent crashed is
    fully compliant while sending nothing, and **`INSUFFICIENT_DATA` is not the safety net
    it looks like**: with `TreatMissingData: notBreaching` a query matching nothing reports
-   green `OK`, confirmed against a live instance during the pilot. Silence looks like health.
+   green `OK`, verified live (`tested_findings.md §2`). Silence looks like health.
 3. **No periodic re-run**, so configuration drift is neither repaired nor detected — a new
-   volume on a running instance stayed unmonitored until the config was re-rendered by hand.
-   `resources: ["*"]` with a **complete** denylist closes the
+   volume on a running instance stayed unmonitored until the config was re-rendered by hand
+   (`tested_findings.md §6`). `resources: ["*"]` with a **complete** denylist closes the
    new-volume case with no trigger at all; a stopped agent or an edited config still needs a
    scheduled run.
 4. **Single Region.** Alarms cannot watch another Region's metrics; multi-Region needs
@@ -281,3 +281,78 @@ moved `/data` from 1.02% to 61.40% while on-host `df` read 62%.
    Ansible; (b) **Metrics Insights alarms — 200 per Region, not adjustable**, giving ≈65
    account-environment scopes; (c) **10,000 metrics per query** ≈ 3,300 VMs per scope, where the
    `PARTIAL_DATA` guard makes approach visible. See `quotas.md`.
+
+---
+
+## 8. Alternative — Metrics Centralization and on-node Ansible
+
+The evaluated-but-not-adopted alternative, kept here as the text-based counterpart to
+`alternative-architecture.svg`. Metrics Centralization physically replicates metrics into a
+destination account rather than federating queries as OAM does; the reasoning, cost arithmetic
+and switch triggers are in README §10.
+
+```mermaid
+flowchart TB
+    subgraph MGMT["🟣 MANAGEMENT / DELEGATED-ADMIN ACCOUNT — new participant"]
+        direction TB
+        RULE["<b>Centralization rule</b><br/>AWS::ObservabilityAdmin::<br/>OrganizationCentralizationRule<br/>scope: Organization | OU | Account"]
+        TA["<b>Organizations trusted access</b><br/>+ service-linked role"]
+    end
+
+    subgraph DEST["🔵 DESTINATION ACCOUNT — owns the data"]
+        direction TB
+        COPY["<b>Centralized metric copy</b><br/>first copy FREE<br/>+ :@aws.account · :@aws.region"]
+        ALARM["<b>Metrics Insights alarms</b><br/>evaluated on LOCAL data<br/>no query federation"]
+        DASH["<b>Dashboard</b><br/>SEARCH now spans everything"]
+        LAM["<b>Enrichment Lambda</b><br/>still assumes into workload<br/>account for DescribeVolumes"]
+        REM["<b>SSM Automation</b><br/>snapshot → ModifyVolume"]
+        HEALTH["<b>Rule health</b><br/>HEALTHY / UNHEALTHY /<br/>PROVISIONING"]
+    end
+
+    subgraph WL["🟢 WORKLOAD ACCOUNTS — N, unchanged from the chosen design"]
+        direction TB
+        CTRL2["Ansible controller reaches<br/>these over SSM — UNCHANGED"]
+        subgraph VPC["VPC — private subnets, NO egress"]
+            EP["<b>VPC endpoints</b><br/><b>monitoring</b> ← still mandatory"]
+            EC2["<b>EC2 instance</b><br/>CloudWatch Agent"]
+        end
+        CW["CloudWatch<br/><b>local copy stays</b><br/>owners keep visibility"]
+        OTHER["⚠️ <b>ALL other custom/EMF/OTLP<br/>metrics in the account</b><br/>cannot be filtered out"]
+    end
+
+    TA --> RULE
+    CTRL2 ==>|"Session Manager<br/>configures agent"| EC2
+    EC2 ==>|"disk_used_percent<br/>every 60s"| CW
+    EC2 -.->|"via monitoring endpoint"| EP
+
+    RULE ==>|"replicates"| COPY
+    CW ==>|"<b>physical copy</b><br/>first copy $0"| COPY
+    OTHER ==>|"<b>replicated too —<br/>NO namespace filter</b>"| COPY
+
+    COPY --> ALARM
+    COPY --> DASH
+    RULE -.-> HEALTH
+    ALARM --> LAM
+    ALARM -->|"≥90%"| REM
+    LAM -.->|"AssumeRole — tags/resource<br/>metadata NOT centralized"| WL
+    REM -->|"cross-account role"| EC2
+
+    classDef mgmt fill:#f3e8fd,stroke:#8430ce,stroke-width:2px
+    classDef dest fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
+    classDef wl fill:#e6f4ea,stroke:#188038,stroke-width:2px
+    classDef warn fill:#fce8e6,stroke:#d13212,stroke-width:2px
+    class MGMT mgmt
+    class DEST dest
+    class WL wl
+    class OTHER warn
+```
+
+---
+
+## Rendered diagrams
+
+Presentation-ready exports of the two headline architectures, embedded in the README:
+
+- [`main-architecture.svg`](main-architecture.svg) — the chosen hub-and-spoke design
+- [`alternative-architecture.svg`](alternative-architecture.svg) — the alternative, showing
+  both Metrics Centralization and on-node Ansible

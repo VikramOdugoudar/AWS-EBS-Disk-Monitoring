@@ -207,14 +207,14 @@ This is the key structural idea in Step 3, and the one most easily collapsed by 
 
 ```
   PATH 1 — CONFIGURATION (Ansible)          PATH 2 — DATA (CloudWatch agent)
-  ──────────────────────────────          ──────────────────────────────────
+  ────────────────────────────────          ──────────────────────────────────
   ansible_mounts (once per run)
         │  mount + fstype only
         ▼
   filter: real block devices                 agent reads config
         │                                          │
         ▼                                          ▼
-  render amazon-cloudwatch-agent.json ───────▶ statvfs() every 60s
+  render amazon-cloudwatch-agent.json ──────▶ statvfs() every 60s
         │                                          │
         ▼                                          ▼
   handler: fetch-config -s                   PutMetricData → CWAgent
@@ -313,10 +313,10 @@ others *filter rows*; `drop_device` **removes a dimension from the metric identi
 filesystem that appears under two device paths collapses to one metric instead of two. It
 **prevents multiplication rather than merely filtering.**
 
-What it does **not** do — confirmed by the pilot — is leave a
+What it does **not** do — and the pilot settles this, `tested_findings.md` §2 — is leave a
 three-dimension metric. **`drop_device: true` removes `device` only. `fstype` survives**,
 so the emitted set is `InstanceId, path, Environment, fstype`. The guard is real; the
-assumption that it produces a minimal dimension set was wrong, and the alarm's `SCHEMA()`
+inference that it produces a minimal dimension set was wrong, and the alarm's `SCHEMA()`
 clause has to name `fstype` too (see the dimension contract below).
 
 **The config also adapts automatically.** Attach and mount a new volume, and the next run
@@ -326,8 +326,8 @@ the expensive mistake.
 
 ### ⚠️ The allowlist fails closed; a denylist fails open
 
-The two filters look symmetric and are not, which the pilot demonstrated the hard way.
-Run with `resources: ["*"]`, `ignore_file_system_types`
+The two filters look symmetric and are not, which the pilot demonstrated the hard way
+(`tested_findings.md` §4). Run with `resources: ["*"]`, `ignore_file_system_types`
 suppressed **25 of 28** mounts on Amazon Linux 2023 — and **`vfat` (`/boot/efi`) leaked
 through and became a billable metric.** Nine pseudo-filesystem types present on AL2023
 were absent from the original 18-entry denylist:
@@ -353,7 +353,7 @@ to un-bill a metric once it has been published.
 ### The `resources: ["*"]` trade, now that it has been measured
 
 The pilot also proved the *upside* that made `["*"]` tempting in the first place, and it is
-larger than early estimates credited. A volume was attached,
+larger than the desk review credited (`tested_findings.md` §6). A volume was attached,
 formatted, mounted and filled to 30% on a running instance and **appeared in CloudWatch
 with no agent reconfiguration and no restart** — the agent's `ActiveEnterTimestamp` never
 moved. Contrast the fact-based enumeration, which is correct but is a **snapshot**: the
@@ -400,7 +400,7 @@ EC2-metadata enrichment hook, not a general dimension bag. **Anything else there
 silently dropped.** No parse error, no log line, no rejected config: the agent starts
 happily and simply does not emit the dimension.
 
-This was verified live. `Environment` appeared as a dimension
+This was verified live (`tested_findings.md` §1). `Environment` appeared as a dimension
 **only** when it was moved into the `disk` section's own `append_dimensions`. A
 per-section `append_dimensions` block is a plugin-level feature and takes arbitrary
 key/value pairs; the top-level one does not.
@@ -482,7 +482,8 @@ Step 4 queries: FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
 ```
 
 **Four dimensions, not three.** This is now an empirical fact rather than a reading of the
-documentation: the pilot ran both clauses side by side against identical data and got
+documentation: the pilot ran both clauses side by side against identical data
+(`tested_findings.md` §2) and got
 
 | Dimensions named in `SCHEMA("CWAgent", …)` | What the query returned |
 |---|---|
@@ -495,7 +496,7 @@ matches nothing**, and the alarm has no metrics to evaluate.
 
 ### It fails worse than `INSUFFICIENT_DATA`
 
-The intuitive expectation is that a
+The intuitive expectation — and what earlier drafts of this document asserted — is that a
 zero-match query leaves the alarm in `INSUFFICIENT_DATA`, where doc 04's
 `InsufficientDataActions` catches it. **It does not.** Combined with `TreatMissingData:
 notBreaching`, which this design sets deliberately so that scale-in does not page anyone, a
@@ -514,6 +515,14 @@ single failure mode in the design** precisely because nothing anywhere reports i
 `drop_device: true` still serves this contract — it removes `device`, which genuinely does
 shift across reboots, so what remains is stable enough for a hardcoded `SCHEMA()` clause
 to name. It just does not make that set as small as it appears.
+
+⚠️ **This contract is not machine-enforced today.** Changing `append_dimensions` in the
+agent template without making the matching change to `SCHEMA()` in
+`cloudformation/20-alarms-dashboard.yaml` produces no error anywhere — and because the runtime
+symptom is a green `OK` rather than a failure, nothing downstream reveals it either. **Treat
+the two files as a single unit and always edit them together.** Asserting the dimension set in
+CI is the single highest-value hardening available to this repo; until it exists, the Phase 6
+`list-metrics` gate in doc 07 is the only place a mismatch is caught.
 
 **Verify against a real instance before finalizing:**
 
@@ -570,22 +579,26 @@ Note this constrains the **role**, not the playbook: the *connection* is
 `amazon.aws.aws_ssm` and the *inventory* is `amazon.aws.aws_ec2`, both controller-side.
 The role itself stays clean.
 
+This is a convention to hold on review: every FQCN in `tasks/main.yml` should start with
+`ansible.builtin.`, and adding a collection-dependent module silently forfeits both properties
+above.
+
 ---
 
 ## Limitations
 
 - **The agent is a component that can fail.** If it stops, metrics stop, and with no
   scheduled re-run (Step 2) nothing repairs or detects it. Doc 04's
-  `InsufficientDataActions` is the documented compensating control; the pilot showed
-  that with `TreatMissingData: notBreaching` **it does not fire on a zero-series query**,
-  so the real compensating controls are the metric-count guard
-  alarm and manual verification. A periodic convergence run and an explicit
+  `InsufficientDataActions` was described as the compensating control; the pilot showed
+  that with `TreatMissingData: notBreaching` **it does not fire on a zero-series query**
+  (`tested_findings.md` §2), so the real compensating controls are the metric-count guard
+  alarm and the CI dimension-contract test. A periodic convergence run and an explicit
   coverage check (doc 07 future work) remain the honest answer here.
 - **`used_percent` only.** Inode exhaustion is a real way to fill a filesystem while
   `used_percent` reads comfortably — a directory full of tiny files. Not covered here.
 - **Configuration is a snapshot.** A volume mounted after the last Ansible run is not
   monitored until the next run. The config adapts automatically *when it runs*, and Step 2
-  has no schedule. **Reproduced live:** a 5 GiB volume filled to
+  has no schedule. **Reproduced live** (`tested_findings.md` §6): a 5 GiB volume filled to
   40% was invisible in CloudWatch — the path simply absent from the index — while AWS
   Config still reported COMPLIANT. `resources: ["*"]` with the hardened denylist closes
   this case with no trigger at all; see the trade-off table above.
