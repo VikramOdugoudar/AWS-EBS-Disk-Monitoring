@@ -77,7 +77,7 @@ alarm, use composite alarms to roll up, or move to a second Region.
 
 The 500-series return cap is not a fleet-size limit; it is a **contributor-count** limit, and the
 alarm's `GROUP BY` decides how many contributors a host produces. Measured live on 2 hosts with
-6 filesystems during the pilot:
+6 filesystems [`tested_findings.md §3`]:
 
 | `GROUP BY` | Contributors per host | 2 hosts produced | 500-cap binds at |
 |---|---|---|---|
@@ -108,10 +108,10 @@ guard alarm exists specifically because this failure is otherwise invisible.
 ⚠️ **A second, closely related silent failure is not a quota at all but behaves like one.** If the
 alarm's `SCHEMA()` clause does not name the metric's exact dimension set, the query matches **zero**
 series and — with `TreatMissingData: notBreaching` — the alarm reports green **`OK` forever**, not
-`INSUFFICIENT_DATA` — confirmed against a live instance during the pilot. So the same *"looks
-healthy, monitors nothing"* outcome as `PARTIAL_DATA` is reachable through a one-word config error,
-and no guard alarm catches it. Worth mentioning here because anyone auditing this design's
-silent-degradation modes from the quota table alone would miss it.
+`INSUFFICIENT_DATA` [`tested_findings.md §2`]. So the same *"looks healthy, monitors nothing"*
+outcome as `PARTIAL_DATA` is reachable through a one-word config error, and no guard alarm catches
+it. Worth mentioning here because anyone auditing this design's silent-degradation modes from the
+quota table alone would miss it.
 
 ---
 

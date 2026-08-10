@@ -46,7 +46,7 @@ still report.
 ⚠️ **And `INSUFFICIENT_DATA` is weaker than that even in the total-silence case.** It was
 verified live that with the design's own `TreatMissingData: notBreaching`, an alarm whose query
 matches **zero** series does not enter `INSUFFICIENT_DATA` at all — it reports a reassuring green
-**`OK`, indefinitely**:
+**`OK`, indefinitely** [`tested_findings.md §2`]:
 
 ```
 State  : OK
@@ -71,13 +71,13 @@ scheduled sweep.
 - a **hand-edited config** stays edited
 - a **newly mounted volume** is not picked up until something else triggers a run
 
-**The last one was reproduced in the pilot.** Attaching a volume fires **no** event this design
-listens for — it is not a launch, not a tag change, not a new account. A 5 GiB volume was
-attached, formatted, mounted and filled to **40%** on a running instance and was **absent from
-CloudWatch entirely** — 2 paths indexed, the new mount missing — until the agent config was
-re-rendered by hand. Nothing reported a problem and AWS Config remained COMPLIANT throughout,
-which is §1.2 and §1.3 compounding: the instance is compliant, monitored, and blind to the
-filesystem most likely to fill.
+**The last one was reproduced in the pilot** [`tested_findings.md §6`]. Attaching a volume fires
+**no** event this design listens for — it is not a launch, not a tag change, not a new account. A
+5 GiB volume was attached, formatted, mounted and filled to **40%** on a running instance and was
+**absent from CloudWatch entirely** — 2 paths indexed, the new mount missing — until the agent
+config was re-rendered by hand. Nothing reported a problem and AWS Config remained COMPLIANT
+throughout, which is §1.2 and §1.3 compounding: the instance is compliant, monitored, and blind
+to the filesystem most likely to fill.
 
 **But the new-volume case has a fix that needs no scheduler.** `resources: ["*"]` with the
 hardened 29-entry denylist was also proven live: a second volume, filled to **30%**, appeared in
@@ -88,7 +88,7 @@ point-in-time snapshot.
 | Approach | New volume picked up | Junk excluded |
 |---|---|---|
 | Ansible allowlist (shipped) | yes, but **only on the next run — needs a trigger** | fully, fails **closed** |
-| `resources: ["*"]` + hardened denylist | **yes, automatically, no trigger** | only if the denylist is complete, fails **open** |
+| `resources: ["*"]` + hardened denylist | **yes, automatically, no trigger** | only if the denylist is complete — fails **open** |
 
 So §6 item 3 (scheduled drift repair) is **no longer the only answer for new volumes** — but it
 is still the only answer for a **stopped agent** or a **hand-edited config**, neither of which the
@@ -100,12 +100,14 @@ The CloudWatch agent runs **inside the OS** and has no concept of an EBS volume.
 metrics do carry `VolumeId`, but they measure **I/O, not fullness**.
 
 **Consequence:** the alarm cannot say which volume to extend. The enrichment Lambda resolves it at
-alert time — but **not from `DescribeVolumes` alone**. `DescribeVolumes` reports the *attachment*
-device name (`/dev/sdf`) and on Nitro the guest renames it (`/dev/nvme1n1`), with no `/dev/sdf`
-block device present, so matching on `Attachments[].Device` cannot work. **Resolution has to run
-on the host.** The verified method is `/sbin/ebsnvme-id /dev/<disk>`, with
+alert time — but **not from `DescribeVolumes` alone**, as this section previously implied.
+`DescribeVolumes` reports the *attachment* device name (`/dev/sdf`) and on Nitro the guest renames
+it (`/dev/nvme1n1`), with no `/dev/sdf` block device present, so matching on
+`Attachments[].Device` cannot work [`tested_findings.md §7`]. **Resolution has to run on the
+host.** The verified method is `/sbin/ebsnvme-id /dev/<disk>`, with
 `/sys/class/nvme/<controller>/serial` as a fallback — note the **controller** path;
-`/sys/block/*/serial` (and therefore `lsblk -o SERIAL`) returns **nothing** on AL2023.
+`/sys/block/*/serial` (and therefore `lsblk -o SERIAL`) returns **nothing** on AL2023, which
+disqualifies the fallback this section used to recommend.
 
 **And the mapping is not always 1:1** — LVM/RAID means several volumes behind one filesystem, so
 "the volume for `/var`" may legitimately be a list. The Lambda reports all attached volumes and
@@ -113,7 +115,8 @@ flags ambiguity rather than guessing.
 
 ### 1.5 Fleet alarms carry NO identity, at any grouping ⚠️ verified
 A Metrics Insights alarm's raw message reports e.g. *"12 out of 1000 time series evaluated to
-ALARM"* — a **count and nothing else**. Read from an actually-firing alarm in the pilot:
+ALARM"* — a **count and nothing else**. Read from an actually-firing alarm in the pilot
+[`tested_findings.md §3`]:
 
 ```
 StateReason     : "1 out of 7 time series evaluated to ALARM"
@@ -125,19 +128,23 @@ expected to name the breaching filesystem; it does not. The detail exists in the
 and is never copied into the **alarm**, so `GROUP BY InstanceId, path` triples the contributor
 count (6 vs 2 on the pilot's two hosts) and buys exactly nothing operationally.
 
-**This changes the status of the enrichment Lambda from optional to mandatory.** It is **not one
-of several routes** to identity. It is the **only** route. There is no grouping, no alarm setting
-and no `StateReasonData` field that yields the breaching instance — the Lambda must re-run the
-alarm's query itself to recover it.
+**This changes the status of the enrichment Lambda from optional to mandatory.** This section
+previously read that the Lambda "fills this in, but it is an extra component in the alert path —
+if it fails, the notification still fires, with less detail." That understates it in both
+directions:
 
-**It is not deployed.** So notifications do not merely risk lacking detail; they
-**always** lack it. Today an on-call responder receiving the 90% page learns that *n* of *m*
-series breached and must go find which, by hand, in the middle of an incident.
+- It is **not one of several routes** to identity. It is the **only** route. There is no grouping,
+  no alarm setting and no `StateReasonData` field that yields the breaching instance — the Lambda
+  must re-run the alarm's query itself to recover it.
+- **It is not deployed.** So notifications do not merely risk lacking detail; they
+  **always** lack it. Today an on-call responder receiving the 90% page learns that *n* of *m*
+  series breached and must go find which, by hand, in the middle of an incident.
 
 The mitigation is therefore not "make the Lambda more reliable" but "deploy it" — and while it is
 absent, the alert is a prompt to investigate rather than a description of what is wrong. Its
-resolution chain (alarm → query → instance + path → EBS volume id) is non-trivial; the label
-format carries a `N - ` rank prefix that a naive parser mis-parses.
+resolution chain (alarm → query → instance + path → EBS volume id) is non-trivial and was traced
+by hand in `tested_findings.md §7`; the label format carries a `N - ` rank prefix that the current
+code mis-parses.
 
 Two ceilings apply once it *is* deployed: beyond 100 breaching contributors `StateReason` shows
 *"100+"*, so the count itself is **not a complete inventory**, and the alarm's 3-hour evaluation
@@ -231,9 +238,9 @@ function**. So "days until full" cannot be an alarm expression — it needs a La
 
 ### 3.1 Single Region
 Sink and link must be **same-Region**, and **alarms cannot watch another Region's metrics**
-(*"the resource must be created in the same Region for which the telemetry resides"*). Cross-*account*
-is fully supported; cross-*Region* is not. Multi-Region means per-Region stacks or a switch to
-Metrics Centralization (§6.7).
+(*"the resource must be created in the same Region for which the telemetry resides"*).
+Cross-*account* is fully supported; cross-*Region* is not. Multi-Region means per-Region stacks or
+a switch to Metrics Centralization (§6.7).
 
 ### 3.2 OAM sharing is not retroactive
 Sharing begins when the link is created. Metrics predating it are not visible. Acceptable here —
@@ -320,16 +327,16 @@ Not defects, but easy to get wrong:
 
 1. **Cost tracks cardinality, not frequency.** Collecting every 60 s costs the same as every
    5 min. Only unique dimension combinations are billed. Verified live: 2 instances × 2 mounts
-   produced **exactly 4 metrics**.
+   produced **exactly 4 metrics** [`tested_findings.md §1`].
 2. **`resources: ["*"]` costs ~11× more** on container hosts — $17,000 vs $1,500/month at
-   1,000 VMs — and it happens **silently**. The pilot adds a
+   1,000 VMs — and it happens **silently**. Guarded by the test suite. The pilot adds a
    qualification: the ~11× is what happens when the **denylist is incomplete**, and the repo's
    was — nine pseudo-filesystem types present on AL2023 were missing, and `vfat` (`/boot/efi`)
-   leaked through as a real billable metric. With all 29 entries the
+   leaked through as a real billable metric [`tested_findings.md §4`]. With all 29 entries the
    wildcard produced the same cardinality as the allowlist. See `alternatives.md §12`; the
    safety point is that an **allowlist fails closed while a denylist fails open**.
 3. ⚠️ **There is no display-time filtering, anywhere — so agent-side filtering is the only cost
-   control that exists.** This is the one most likely to be
+   control that exists** [`tested_findings.md §5`]. This is the one most likely to be
    misunderstood, because every instinct says an over-broad metric can be tidied up later. It
    cannot:
    - Once published, a metric is **stored and billed for 15 months**. Neither CloudWatch nor OAM
@@ -362,8 +369,8 @@ Each is additive; none requires redesign.
 ⚠️ **Ahead of all of them: deploy the enrichment Lambda.** It is listed last-ish nowhere because
 the pilot moved it out of "deferred" entirely. §1.5 was written as though the Lambda added polish;
 it is in fact the **only** mechanism that names the breaching instance, and it is **not deployed**,
-so every notification the design would send today identifies nothing. The corrections it needs
-before deployment: add `fstype` to its `SCHEMA()` clause, parse the
+so every notification the design would send today identifies nothing. `tested_findings.md §7`–`§8`
+list the corrections it needs before deployment: add `fstype` to its `SCHEMA()` clause, parse the
 `N - ` rank prefix out of result labels, and resolve the volume with `ebsnvme-id` on the host
 rather than `Attachments[].Device`. A page nobody can act on is worse than drift nobody has hit
 yet, so this outranks items 2 and 3 below.
@@ -377,8 +384,8 @@ yet, so this outranks items 2 and 3 below.
    association, or a periodic controller run, makes the design self-healing. **One property
    change.** Scope note after the pilot: this is still required for a **stopped agent** and a
    **hand-edited config**, but it is **no longer the only fix for a newly attached volume** —
-   `resources: ["*"]` with the hardened 29-entry denylist picks those up with no trigger at all.
-   The two are complementary rather than alternatives, and the
+   `resources: ["*"]` with the hardened 29-entry denylist picks those up with no trigger at all
+   [`tested_findings.md §6`]. The two are complementary rather than alternatives, and the
    allowlist-vs-denylist safety trade is argued in `alternatives.md §12`.
 4. **Reclaim before growing** — journal vacuum, logrotate, package cache, `docker system prune`,
    then re-measure and stop if resolved. A disk at 90% is often 90% logs, where growing the volume
@@ -395,7 +402,7 @@ yet, so this outranks items 2 and 3 below.
    `GROUP BY` to `:@aws.account, :@aws.region`).
 8. **Predictive "days until full"** — a Lambda fitting a slope over ~14 days, alarmed at `< 7`.
    Needs code because of §2.4. Catches slow leaks a static threshold misses until it is nearly too
-   late.
+   late — arguably closest to the CTO's actual ask.
 9. **Per-application alarm scoping** — add `Application` to `append_dimensions` and split alarms
    with `WHERE`. Also the natural **sharding strategy** at the metric ceiling (§2.1).
 10. **Windows support** — closes §1.7.
@@ -409,46 +416,6 @@ yet, so this outranks items 2 and 3 below.
 
 ---
 
-## What the live pilot confirmed
-
-A working subset of this design was deployed into two real accounts — workload `<1111111111>`
-sharing into monitoring `<2222222222>` — and exercised against real AWS APIs on 2026-08-10. Full
-record and quoted outputs are in `tested_findings.md`; this section keeps only the findings that
-change a conclusion.
-
-**Confirmed, previously inference:** SSM reachability with no public IP and no NAT (both
-instances `Online` in 10 s); metrics reaching CloudWatch over the `monitoring` endpoint; the
-metric tracking filesystem reality (writing 6 GiB moved `/data` to 61.40%, matching `df`); OAM
-sharing metrics cross-account; one alarm firing on hosts across an account boundary; `MAX`
-collapsing multiple mounts to the fullest per host, as designed.
-
-**Four defects found that no amount of reading would have caught:**
-
-1. **`fstype` is a fourth emitted dimension.** `drop_device: true` removes `device` only, not
-   `fstype`, so the emitted set is `InstanceId, path, Environment, fstype`. A three-dimension
-   `SCHEMA()` clause matches nothing. Worse, with `TreatMissingData: notBreaching` a zero-match
-   query reports a reassuring green `OK` forever rather than `INSUFFICIENT_DATA` — so the design's
-   documented compensating control does not fire (§1.2, §2.1 above).
-2. **A fleet alarm carries no identity at any `GROUP BY`.** Adding `path` to the grouping was
-   expected to name the breaching filesystem; it triples the contributor count instead and names
-   nothing, because the detail lives in the query result, never the alarm (§1.5 above).
-3. **The agent-side denylist leaked 9 pseudo-filesystems**, including `vfat` on `/boot/efi`, which
-   became a real billable metric until the denylist was hardened to 29 entries (§5.2 above).
-4. **Mount-to-volume resolution cannot use `Attachments[].Device`.** On Nitro instances the guest
-   renames the device, so the documented EC2-side mapping does not work; resolution has to run on
-   the host via `ebsnvme-id` (§1.4 above).
-
-**Also reproduced live:** the drift gap in §1.3 (a newly attached, unmonitored volume stayed
-invisible until Ansible re-ran), and the fix that needs no scheduler (`resources: ["*"]` plus the
-hardened denylist picked up a new volume automatically).
-
-**What the pilot did not cover**, so it is not read as broader validation than it is: the Ansible
-controller and playbook path (configuration was applied via SSM Run Command instead), event-driven
-enrollment, remediation, the enrichment Lambda, SNS delivery, and anything at scale — it ran on two
-instances. Full detail: `tested_findings.md`.
-
----
-
 ## The honest summary
 
 This design reliably detects **byte exhaustion on Linux EC2 instances in one Region**, across any
@@ -456,7 +423,7 @@ number of accounts, with no host list to maintain and no alarm to create per ins
 detection claim is now measured rather than argued** — the pilot confirmed SSM reachability with no
 public IP and no NAT, metrics arriving over the `monitoring` endpoint, the metric tracking `df` to
 within a percentage point, OAM sharing working cross-account, and **one alarm firing on hosts
-across an account boundary**.
+across an account boundary** [`tested_findings.md §1`].
 
 Its four real weaknesses:
 1. **Remediation is incomplete** — it grows the volume but cannot yet make the space usable.
@@ -467,8 +434,8 @@ Its four real weaknesses:
    component that recovers it is not deployed (§1.5).
 
 The first three are addressed by deferred items 1–3 and the fourth by deploying the enrichment
-Lambda; **none requires the architecture to change.** The pilot changed the *severity ordering*,
-not the design: weakness 4 was previously read as cosmetic and is not.
+Lambda; **none requires the architecture to change.** What the pilot changed was the *severity
+ordering*, not the design: weakness 4 was previously read as cosmetic and is not.
 
 ---
 
@@ -476,5 +443,5 @@ not the design: weakness 4 was previously read as cosmetic and is not.
 
 - `alternatives.md` — every option considered and why it was not chosen
 - `quotas.md` — every AWS quota this design touches, and which ones bind
-- `tested_findings.md` — the live-pilot record, with commands and outputs
+- `context_2.md` — the full decision record, including reversals and corrections
 - `docs/01`–`docs/07` — each decision argued in its own context

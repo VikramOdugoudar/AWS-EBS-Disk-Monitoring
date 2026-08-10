@@ -3,7 +3,7 @@ Turn a fleet disk alarm into an actionable alert, and drive remediation at 90%.
 
 WHY THIS EXISTS
     A Metrics Insights alarm carries NO identity. Verified on a firing alarm during the
-    live pilot:
+    live pilot (tested_findings.md 3):
 
         StateReason     : "1 out of 7 time series evaluated to ALARM"
         StateReasonData : {"version": "1.0", "queryDate": "..."}
@@ -27,9 +27,10 @@ WHY VOLUME RESOLUTION RUNS ON THE HOST
         guest says : /data          -> /dev/nvme1n1
 
     There is no /dev/sdf block device in the guest, only a symlink. So matching on
-    Attachments[].Device CANNOT work. `ebsnvme-id` is the AWS-provided tool that reports
-    the volume id directly; the NVMe controller serial is the fallback. Note
-    /sys/block/<disk>/serial returns NOTHING on AL2023 — that method was tried and failed.
+    Attachments[].Device CANNOT work (this disproves findings.md 17.2's proposed fix).
+    `ebsnvme-id` is the AWS-provided tool that reports the volume id directly; the NVMe
+    controller serial is the fallback. Note /sys/block/<disk>/serial returns NOTHING on
+    AL2023 — that method was tried and failed.
 """
 
 import json
@@ -51,7 +52,7 @@ METRIC_NAME = "disk_used_percent"
 # fstype is NOT optional. The agent emits InstanceId, path, Environment AND fstype;
 # drop_device removes `device` but not `fstype`. SCHEMA() is an exact-set match, so
 # omitting it matches nothing — and with TreatMissingData: notBreaching the alarm then
-# reports a green OK forever rather than INSUFFICIENT_DATA.
+# reports a green OK forever rather than INSUFFICIENT_DATA (tested_findings.md 2).
 SCHEMA_DIMENSIONS = "InstanceId, path, Environment, fstype"
 
 READ_ROLE_NAME = os.environ.get("READ_ROLE_NAME", "DiskMonitoringReadRole")
@@ -259,9 +260,9 @@ def describe_volume(account_id: str, volume_id: str):
 def start_remediation(account_id: str, finding: dict):
     """Grow the resolved volume. Only called on the CRITICAL path.
 
-    The alarm's own event cannot supply an InstanceId, so wiring the alarm directly to
-    the SSM document could never work. This function has the resolved instance AND path,
-    so it can.
+    This is the fix for findings.md 5: the alarm's own event cannot supply an InstanceId,
+    so wiring the alarm directly to the SSM document could never work. This function has
+    the resolved instance AND path, so it can.
 
     DryRun MUST be passed as 'false' explicitly — the document defaults to 'true' and is
     otherwise permanently inert while reporting success.

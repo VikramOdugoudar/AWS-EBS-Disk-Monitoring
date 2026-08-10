@@ -49,8 +49,8 @@ cw_agent_ignore_fstypes:
   - nsfs
   # Observed live on AL2023 and absent from the original list. `vfat` is the one that
   # actually leaked through and became a billable metric (/boot/efi) when resources
-  # was set to ["*"] — confirmed against a live instance during the pilot. A denylist
-  # fails OPEN, so it must be complete; the allowlist below fails CLOSED and is immune.
+  # was set to ["*"] — see tested_findings.md 4. A denylist fails OPEN, so it must be
+  # complete; the allowlist below fails CLOSED and is immune.
   - vfat
   - ramfs
   - efivarfs
