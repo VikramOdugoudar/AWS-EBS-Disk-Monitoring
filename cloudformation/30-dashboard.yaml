@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — cross-account dashboard in the monitoring account.
+  Alarms DECIDE; the dashboard EXPLAINS. Neither replaces the other: an alarm
+  cannot show a trend, and a dashboard cannot wake anyone at 3am.
+
+Parameters:
+  DashboardName:
+    Type: String
+    Default: disk-monitoring
+
+Resources:
+
+  # ===========================================================================
+  # SEARCH() is banned inside alarms but LEGAL here — the same rule, not an
+  # inconsistency: an alarm must resolve to ONE deterministic state, a widget just
+  # draws what it is given. Consequence: this dashboard keeps `path`, which the alarms
+  # group away, so the filesystem-level detail lives HERE — which is why notifications
+  # carry a dashboard link. Full reasoning and the cost comparison: docs/04 §4c.
+  # ===========================================================================
+  DiskDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Disk Utilization — Fleet View\n**Alarms decide; this explains.** The alarm names the *instance*; this shows *which filesystem* and its trend — which decides whether to clean up logs or resize a volume."
+              }
+            },
+            {
+              "//": "SORT(..., 20) is load-bearing, not cosmetic: the 500-series cap applies to SEARCH too, and SORT only orders what was returned. Do not drop the 20.",
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 8,
+              "properties": {
+                "title": "Worst 20 mounts, fleet-wide (self-populating)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  [ { "expression": "SORT(SEARCH('{CWAgent,InstanceId,path,Environment} MetricName=\"disk_used_percent\"', 'Maximum'), MAX, DESC, 20)", "label": "", "id": "worst20" } ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100, "label": "% used" } },
+                "annotations": {
+                  "horizontal": [
+                    { "label": "critical 90%", "value": 90, "color": "#d13212" },
+                    { "label": "warning 80%", "value": 80, "color": "#ff7f0e" }
+                  ]
+                },
+                "period": 300
+              }
+            },
+            {
+              "//": "COUNT() returns DATAPOINTS, not instances and not series. This widget shows growth in monitored volume, NOT how many hosts are above a threshold — that view is the Worst-20 widget's 80% annotation.",
+              "type": "metric",
+              "x": 12, "y": 2, "width": 12, "height": 8,
+              "properties": {
+                "title": "Metric volume by environment — is the fleet growing?",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "metrics": [
+                  [ { "expression": "SELECT COUNT(disk_used_percent) FROM SCHEMA(\"CWAgent\", InstanceId, path, Environment, fstype) GROUP BY Environment", "label": "datapoints/hour by environment", "id": "cnt" } ]
+                ],
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 10, "width": 12, "height": 6,
+              "properties": {
+                "title": "Worst disk per account",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "metrics": [
+                  [ { "expression": "SELECT MAX(disk_used_percent) FROM SCHEMA(\"CWAgent\", InstanceId, path, Environment, fstype) GROUP BY AWS.AccountId ORDER BY MAX() DESC", "label": "", "id": "byacct" } ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } },
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 10, "width": 12, "height": 6,
+              "properties": {
+                "title": "Worst disk per environment",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "metrics": [
+                  [ { "expression": "SELECT MAX(disk_used_percent) FROM SCHEMA(\"CWAgent\", InstanceId, path, Environment, fstype) GROUP BY Environment ORDER BY MAX() DESC", "label": "", "id": "byenv" } ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } },
+                "period": 300
+              }
+            },
+            {
+              "//": "EMPTY BY CONSTRUCTION. Alarm ARNs are per-account-per-environment outputs of 20-alarms-dashboard.yaml and no parameter here receives them, so this widget can never render. Add an AlarmArns parameter before relying on it.",
+              "type": "alarm",
+              "x": 0, "y": 16, "width": 24, "height": 4,
+              "properties": {
+                "title": "Disk alarms — current state (NOT WIRED)",
+                "alarms": []
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 20, "width": 24, "height": 4,
+              "properties": {
+                "markdown": "## Known coverage limit\nAWS Config verifies *configuration* (tag present, instance profile attached) but cannot verify the *outcome* (metrics arriving). An instance whose agent crashed is fully Config-compliant while sending nothing, and the alarms' `INSUFFICIENT_DATA` fires only if metrics stop **everywhere** — one silent instance among many leaves them in OK.\n\nClosing this needs a coverage check comparing running instances against instances publishing metrics — see *Future work #2* in the design."
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardUrl:
+    Description: >-
+      TODO — not yet consumed. docs/04 §4d treats a dashboard link in AlarmDescription as
+      the enrichment Lambda's manual fallback, but 20-alarms-dashboard.yaml does not
+      include it, so that fallback does not exist.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DashboardName}'

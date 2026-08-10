@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — VPC endpoints for the MONITORING account's controller subnet.
+
+  WHY THIS EXISTS
+  11-workload-endpoints.yaml covers WORKLOAD instances. The CONTROLLER needs its own
+  private path to Organizations, STS, EC2, SSM and S3 — without it no inventory is ever
+  produced, every task fails AccessDenied, and EventBridge runs match zero targets.
+  Per-endpoint rationale is at each resource below.
+
+  ==> IN THE CONTROL-PLANE REGION, EVERY AWS API PATH IS PRIVATELINK. NO NAT, NO EGRESS.
+
+  Organizations included: its endpoint is Region-RESTRICTED (control-plane Region only,
+  us-east-1 in commercial partitions), NOT unavailable. The common claim that Organizations
+  has no PrivateLink support — and that the controller therefore needs NAT — is wrong.
+  Outside a control-plane Region, use Transit Gateway rather than NAT. See docs/01 and the
+  Rules AssertDescription below.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the Ansible controller.
+
+  ControllerSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Subnet(s) hosting the controller — one per AZ it may run in. An AZ without an
+      endpoint ENI cannot reach the service.
+
+  ControllerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security group attached to the Ansible controller. Referenced by the endpoint SG to
+      allow 443 inbound.
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Route tables to associate with the free S3 gateway endpoint. A subnet whose route
+      table is not listed cannot reach S3, and Ansible cannot stage module files.
+
+# ===========================================================================
+# REGION GUARD — fail at deploy time, loudly, rather than succeeding while silently
+# omitting the one endpoint render_inventory.sh depends on. The reason and the
+# alternative live in the AssertDescription so they reach the operator, not just a
+# reader of this file.
+# ===========================================================================
+Rules:
+  MonitoringAccountMustBeInControlPlaneRegion:
+    Assertions:
+      - Assert: !Contains
+          - - us-east-1
+            - cn-northwest-1
+            - us-gov-west-1
+          - !Ref 'AWS::Region'
+        AssertDescription: >-
+          This stack must be deployed in an AWS Organizations control-plane Region
+          (us-east-1 in commercial partitions, cn-northwest-1 in China, us-gov-west-1 in
+          GovCloud), because the Organizations interface VPC endpoint exists only there.
+          To run the monitoring account in another Region, remove the Organizations
+          endpoint from this stack and reach a us-east-1 endpoint over AWS Transit Gateway
+          instead. Do NOT substitute NAT - that would relax the design's no-egress posture
+          for the most privileged host in the estate.
+
+Resources:
+
+  # ENDPOINT SECURITY GROUP — same trap as 11-workload-endpoints.yaml: the ENDPOINTS
+  # need 443 inbound, and missing it presents as an unexplained timeout, not a
+  # permission error.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from the Ansible controller to interface endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ControllerSecurityGroupId
+          Description: HTTPS from the Ansible controller
+      Tags:
+        - Key: Name
+          Value: disk-monitoring-controller-endpoints
+        - Key: Project
+          Value: disk-monitoring
+
+  # ===========================================================================
+  # SSM TRIO — makes the CONTROLLER itself a managed node.
+  #
+  # Easy to overlook, because the instinct is that endpoints are for the hosts being
+  # managed. But EventBridge invokes playbook runs on the controller via Run Command,
+  # which requires the controller to be a registered managed node. Without these, a
+  # SendCommand targeting the controller's tag matches ZERO instances and returns
+  # TargetCount: 0 with status Success — the trigger silently does nothing.
+  # ===========================================================================
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # Session Manager data channel. Used in BOTH directions here: inbound so Run Command
+  # can reach the controller, and outbound because the aws_ssm connection plugin rides
+  # this channel to reach workload instances.
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # STS — required by site.yml's pre_tasks, whose sts:AssumeRole call happens ON THE
+  # CONTROLLER (see SessionRole in 10-workload-iam.yaml for why it exists).
+  #
+  # ⚠️ NOT SUFFICIENT ON ITS OWN. The GLOBAL endpoint sts.amazonaws.com bypasses this
+  # endpoint entirely, so the caller must target the REGIONAL endpoint. Set
+  # AWS_STS_REGIONAL_ENDPOINTS=regional on the controller.
+  # ===========================================================================
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # ORGANIZATIONS — the endpoint commonly believed not to exist.
+  #
+  # render_inventory.sh calls organizations:describe-organization and list-accounts to
+  # enumerate the estate at runtime. That is the mechanism behind the design's headline
+  # property: NO STATIC ACCOUNT LIST EXISTS ANYWHERE. Under `set -euo pipefail` an
+  # unreachable Organizations API means the script exits and NO INVENTORY IS PRODUCED —
+  # so this endpoint is what makes runtime account discovery work without egress.
+  #
+  # Region-restricted, not unavailable — see the Rules section and the header. The stack
+  # is us-east-1-only precisely so this can be unconditional; a CloudFormation Condition
+  # here would trade a loud deploy failure for a silent capability gap.
+  # ===========================================================================
+  OrganizationsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.organizations'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # EC2 — dynamic inventory's DescribeInstances.
+  #
+  # The inventory plugin calls DescribeInstances with credentials assumed into each
+  # workload account, but the API call itself is made FROM the controller, so it needs a
+  # local path to the EC2 API. Without it `ansible-inventory --graph` hangs and then
+  # fails, which reads like an IAM problem and is not one.
+  # ===========================================================================
+  Ec2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # CLOUDWATCH (monitoring) — for the controller-side verification calls in docs/07
+  # Phase 6, and for anything VPC-attached to these subnets later. NOTE the enrichment
+  # Lambda is not deployed by any template today, and a Lambda's egress is its own VPC
+  # config rather than this subnet's. Absence is confusing to debug in exactly the way
+  # the workload-side monitoring endpoint is.
+  # ===========================================================================
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: !Ref ControllerSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ===========================================================================
+  # S3 GATEWAY ENDPOINT — FREE. Same consumers as 11-workload-endpoints.yaml, with the
+  # direction reversed: the CONTROLLER uploads each module file and the target fetches
+  # it by presigned URL. Also the AL repos for ansible-core and session-manager-plugin.
+  # Omitting it breaks configuration management silently.
+  #
+  # NOTE collections (ansible-galaxy) and Python packages (pip) are NOT AWS APIs and are
+  # not reachable through any endpoint in this stack — bake them into the AMI or mirror
+  # them into the transfer bucket.
+  # ===========================================================================
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+Outputs:
+  EndpointSecurityGroupId:
+    Value: !Ref EndpointSecurityGroup
+
+  StsEndpointId:
+    Description: >-
+      Required by site.yml's cross-account credential pre_tasks. Remember
+      AWS_STS_REGIONAL_ENDPOINTS=regional — the global STS endpoint bypasses this.
+    Value: !Ref StsEndpoint
+
+  S3GatewayEndpointId:
+    Description: Free, and required for Ansible module staging and package installs.
+    Value: !Ref S3GatewayEndpoint
+
+  OrganizationsEndpointId:
+    Description: >-
+      Makes runtime account enumeration work with no egress — the mechanism behind "no
+      static account list exists anywhere". Consumed by scripts/render_inventory.sh.
+    Value: !Ref OrganizationsEndpoint
+
+  NoEgressConfirmation:
+    Description: >-
+      Every AWS API the controller calls is reachable over PrivateLink from this stack:
+      Organizations, STS, EC2, SSM (x3), CloudWatch, and S3 via the free gateway endpoint.
+      The controller subnet requires NO NAT gateway, NO internet gateway and NO Transit
+      Gateway. README assumption 2 therefore holds for the monitoring account exactly as it
+      does for workload accounts.
+    Value: >-
+      Controller subnet requires no internet egress — 7 interface endpoints + 1 free S3
+      gateway endpoint cover every API path.

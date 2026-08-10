@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Disk monitoring — alarms and remediation wiring. The dashboard is 30-dashboard.yaml,
+  despite this file's name. Deploy LAST (Phase 7 of docs/07): alarms need metrics to
+  evaluate against, and arming irreversible volume growth before validating the alarm
+  risks it firing on bad data.
+
+Parameters:
+  TargetAccountId:
+    Type: String
+    Description: >-
+      Workload account this alarm set covers. One alarm set per account+environment —
+      docs/04 explains why that partitioning is free.
+    AllowedPattern: '^[0-9]{12}$'
+
+  EnvironmentName:
+    Type: String
+    Description: Environment dimension value emitted by the agent (see Ansible defaults).
+    AllowedValues: [prod, staging, dev, sandbox, unscoped]
+
+  WarningThreshold:
+    Type: Number
+    Default: 80
+    Description: prod 80 / dev 90 — differentiated thresholds are the point of scoping.
+
+  CriticalThreshold:
+    Type: Number
+    Default: 90
+
+  WarningTopicArn:
+    Type: String
+  CriticalTopicArn:
+    Type: String
+  RemediationDocumentArn:
+    Type: String
+    Description: ARN of the DiskSpace-GrowVolume SSM Automation document.
+  RemediationRoleArn:
+    Type: String
+    Description: Role EventBridge assumes to start the remediation automation.
+
+Resources:
+
+  # ===========================================================================
+  # WARNING ALARM — 80% (prod). Notifies only.
+  #
+  # Full derivation, the three rejected alternatives (per-VM alarms, SEARCH() in an
+  # alarm, metric math) and the cost model are in docs/04-aggregation-alarming.md.
+  #
+  # Three things you can break by editing the query below:
+  #   * SCHEMA(...) must name EVERY dimension the agent emits, or NOTHING matches and
+  #     the alarm sits in INSUFFICIENT_DATA forever. It is a filter, not a projection.
+  #   * `path` is deliberately ABSENT from GROUP BY — 1,000 contributors, not 3,000,
+  #     which is what keeps this inside the 500-series return cap.
+  #   * ORDER BY MAX() DESC is CORRECTNESS, not cosmetics: past 500 series it decides
+  #     WHICH series are evaluated. And never AVG — 45/94/20% averages to 53%.
+  #
+  # Scoping per account+environment is free (billing is per metric ANALYZED); what
+  # costs more is OVERLAPPING scopes, so partition cleanly.
+  # ===========================================================================
+  DiskWarningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-warning-${TargetAccountId}-${EnvironmentName}'
+      AlarmDescription: !Sub |
+        Disk usage at or above ${WarningThreshold}% on one or more instances in
+        account ${TargetAccountId} (${EnvironmentName}).
+
+        The alarm names the INSTANCE, not the mount — mounts are grouped away to
+        stay within the 500-series cap. The enrichment Lambda adds the specific
+        path and EBS volume ID to the notification; the dashboard shows the
+        filesystem-level view and its trend.
+      Metrics:
+        - Id: q_disk_warning
+          ReturnData: true
+          Period: 300
+          Expression: !Sub >-
+            SELECT MAX(disk_used_percent)
+            FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
+            WHERE AWS.AccountId = '${TargetAccountId}' AND Environment = '${EnvironmentName}'
+            GROUP BY InstanceId
+            ORDER BY MAX() DESC
+      Threshold: !Ref WarningThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # M-of-N: a build writing a temp file can breach for a single period then
+      # clean up. Requiring 2 of 3 means the condition must persist ~10 minutes.
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      # Contributors churn constantly as instances launch and terminate. A
+      # terminated instance stops reporting, and that silence must NOT be read as
+      # a full disk — otherwise every scale-in event would alarm.
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref WarningTopicArn
+      # Notify on INSUFFICIENT_DATA too: that state means the alarm is evaluating
+      # NOTHING (usually a dimension mismatch), so it looks calm while blind.
+      InsufficientDataActions:
+        - !Ref WarningTopicArn
+      OKActions:
+        - !Ref WarningTopicArn
+
+  # ===========================================================================
+  # CRITICAL ALARM — 90%. INTENDED to trigger EBS volume growth; the wiring does
+  # not yet work — see the RemediationRule note below.
+  # Tightened to 2-of-2: at 90% you would rather be slightly early than late.
+  # ===========================================================================
+  DiskCriticalAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-critical-${TargetAccountId}-${EnvironmentName}'
+      AlarmDescription: !Sub |
+        Disk usage at or above ${CriticalThreshold}% in account ${TargetAccountId}
+        (${EnvironmentName}). Automatic EBS volume growth is NOT yet armed from this
+        alarm — respond manually.
+
+        NOTE: ModifyVolume grows the VOLUME only. The filesystem must then be
+        extended (growpart + resize2fs/xfs_growfs) before the OS can use the new
+        space — that step is deferred, so remediation notifies rather than
+        claiming the problem is solved.
+      Metrics:
+        - Id: q_disk_critical
+          ReturnData: true
+          Period: 300
+          Expression: !Sub >-
+            SELECT MAX(disk_used_percent)
+            FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
+            WHERE AWS.AccountId = '${TargetAccountId}' AND Environment = '${EnvironmentName}'
+            GROUP BY InstanceId
+            ORDER BY MAX() DESC
+      Threshold: !Ref CriticalThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref CriticalTopicArn
+      InsufficientDataActions:
+        - !Ref CriticalTopicArn
+
+  # ===========================================================================
+  # PARTIAL_DATA GUARD
+  #
+  # Past 10,000 matched metrics (~3,300 VMs) a Metrics Insights alarm sets
+  # EvaluationState: PARTIAL_DATA and KEEPS REPORTING A STATE derived from
+  # incomplete data — healthy-looking while monitoring only part of the fleet.
+  # Without this guard the design reproduces the silent-blind-spot failure that
+  # disqualified per-VM alarms. See docs/04 "Hard limits".
+  #
+  # ⚠️ COUNT() COUNTS DATAPOINTS, NOT DISTINCT METRICS, and there is no GROUP BY —
+  # you cannot count metrics from inside an alarm expression. So the threshold is
+  # expressed in DATAPOINTS:
+  #
+  #     threshold = metrics_target x (Period / collection_interval)
+  #
+  # At Period 3600 with the agent's 60s interval that is 60 datapoints per metric,
+  # so a 3,000-metric warning line is 180,000 — NOT 3,000, and certainly not 400,
+  # which roughly 7 metrics already exceed. An earlier version used 400 and was
+  # therefore in ALARM from first deploy at any real fleet size, which is worse than
+  # no guard: a guard that cries wolf gets muted, and then the silent mode is
+  # unguarded. RECOMPUTE this number if Period or the collection interval changes,
+  # and do not "simplify" it back to a metric count.
+  # ===========================================================================
+  MetricCountGuardAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'disk-metric-count-guard-${TargetAccountId}-${EnvironmentName}'
+      AlarmDescription: >-
+        Datapoint volume in this alarm scope implies roughly 3,000 metrics, approaching
+        the 10,000-metric query ceiling past which coverage silently degrades. Shard by
+        a narrower scope (add Application, or split by mount class) — docs/07 Future
+        work #6. NOTE the threshold is datapoints, not metrics: divide by
+        Period / collection_interval (3600 / 60 = 60) to read it as a metric count.
+      Metrics:
+        - Id: q_datapoint_count
+          ReturnData: true
+          Period: 3600
+          Expression: !Sub >-
+            SELECT COUNT(disk_used_percent)
+            FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
+            WHERE AWS.AccountId = '${TargetAccountId}' AND Environment = '${EnvironmentName}'
+      # 3,000 metrics x (3600s period / 60s interval) = 180,000 datapoints/hour.
+      # See the arithmetic in the block comment above before changing this.
+      Threshold: 180000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref WarningTopicArn
+
+  # ===========================================================================
+  # REMEDIATION TRIGGER — critical alarm -> SSM Automation.
+  #
+  # ⚠️ NOT FUNCTIONAL AS WIRED. Three independent reasons:
+  #   1. A fleet alarm's state-change event carries NO InstanceId (per-contributor
+  #      identity is a separate Contributor State Change detail-type), and
+  #      DiskSpace-GrowVolume requires one. The enrichment Lambda must be the
+  #      invoker — it already resolves instance, path and volume (docs/04 §4d).
+  #   2. InputTemplate below is NOT under !Sub, so ${TargetAccountId} and
+  #      ${EnvironmentName} ship as literal strings. Compare
+  #      00-monitoring-account.yaml, which correctly uses `InputTemplate: !Sub |`.
+  #   3. The parameters passed here and the ones the document requires have ZERO
+  #      overlap, and DryRun is never passed — that document defaults to 'true',
+  #      so even a corrected invocation would be inert while reporting success.
+  # ===========================================================================
+  RemediationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'disk-remediation-${TargetAccountId}-${EnvironmentName}'
+      Description: Start EBS volume growth when the critical alarm enters ALARM.
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        resources:
+          - !GetAtt DiskCriticalAlarm.Arn
+        detail:
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Id: StartGrowVolumeAutomation
+          Arn: !Ref RemediationDocumentArn
+          RoleArn: !Ref RemediationRoleArn
+          InputTransformer:
+            InputPathsMap:
+              alarmName: '$.detail.alarmName'
+              reason: '$.detail.state.reason'
+            InputTemplate: |
+              {
+                "AlarmName": ["<alarmName>"],
+                "StateReason": ["<reason>"],
+                "TargetAccountId": ["${TargetAccountId}"],
+                "EnvironmentName": ["${EnvironmentName}"]
+              }
+
+Outputs:
+  WarningAlarmArn:
+    Value: !GetAtt DiskWarningAlarm.Arn
+  CriticalAlarmArn:
+    Value: !GetAtt DiskCriticalAlarm.Arn
