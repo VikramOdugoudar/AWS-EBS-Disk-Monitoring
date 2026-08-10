@@ -249,6 +249,58 @@ becomes a **task failure — not a skip**. Failures count toward `max_fail_perce
 an edge case; it is routine in any fleet with churn. The filter is what keeps a scale-in
 event from breaking the next deployment.
 
+### ⚠️ The filter reads *cached* state, so a window remains
+
+The filter removes stopped instances **as of the last inventory query** — and inventory is
+cached for **300 seconds**, set in two places (`cache_timeout` in `ansible.cfg` and again in
+`inventory/aws_ec2.yml.template`). Inside that window an instance that has just stopped is
+still listed as `running`, so the filter cannot help:
+
+```
+T+0     instance stops
+T+10s   run starts → cached inventory still says `running` → instance is targeted
+        → pre_tasks assume-role SUCCEEDS  (delegate_to: localhost — the dead target
+          is never touched, so this step cannot detect the problem)
+        → setup task opens ssm:StartSession → TargetNotConnected → host unreachable
+        → consumes the max_fail_percentage budget
+```
+
+**The assume-role step succeeding is what makes this hard to read in a log.** The first three
+tasks pass and the failure lands on *fact gathering*, which looks like a problem with the
+target — a broken endpoint, a missing profile, an agent that died — rather than what it is:
+inventory describing a fleet that has since changed.
+
+**The window can be narrowed but never closed.** Even with caching disabled entirely,
+`DescribeInstances` reports state *at query time*, and an instance can stop moments later,
+mid-run. **Any push-based configuration model over a live fleet has this race**; caching only
+sets how wide it is.
+
+**Availability is not the concern — signal is.** `max_fail_percentage: 5` absorbs a handful of
+these and `serial` confines them to one batch, so a few stopped instances will not break a
+run. The real objection is that **the failure budget exists to stop a systematically broken
+change**, and routine instance churn spending it conflates two unrelated problems: at enough
+churn, a legitimate run aborts for reasons that have nothing to do with the change being
+deployed.
+
+| Mitigation | Effect | Cost |
+|---|---|---|
+| `ANSIBLE_INVENTORY_CACHE=False` on the single-instance event path | Narrows the window to the run itself | One extra `DescribeInstances` per event — negligible for a `--limit` run |
+| Lower `cache_timeout` | Narrows proportionally | More EC2 API calls on bulk runs, which is exactly what the cache exists to prevent |
+| Pre-flight filter on `ssm:DescribeInstanceInformation` `PingStatus=Online` | **Eliminates the class** — a stopped instance is never `Online` | An extra call plus a step in `scripts/render_inventory.sh` |
+
+**`ignore_unreachable: true` is deliberately not recommended.** It would make these hosts
+skip silently — but it would equally mask the case where *every* host is unreachable, from a
+missing `monitoring` endpoint or a security group that does not admit the instance SG. The run
+would then report success having configured nothing, which is the silent-success failure mode
+this design works hardest to avoid.
+
+**The same cache causes the opposite failure**, and that direction is already flagged in
+`cloudformation/00-monitoring-account.yaml`: a 300-second-old inventory *predates* a
+just-launched instance, so `ansible-playbook --limit <new-instance>` matches **zero hosts and
+still exits `0`** — enrollment silently does nothing. The two failures are mirror images of one
+stale read, and **one change fixes both**: disabling the inventory cache on the event-driven
+path, where a single `DescribeInstances` costs nothing and freshness is the entire point.
+
 ---
 
 ## Rejected — `AWS-ApplyAnsiblePlaybooks` on-node

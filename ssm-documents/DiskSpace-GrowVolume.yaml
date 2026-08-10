@@ -18,9 +18,12 @@ description: |
       There is NO minimum cooldown — see the note above MAX_MODS_PER_24H.
     * volumes can only GROW, never shrink -> EVERY ACTION IS IRREVERSIBLE
     * modification is online on current-generation instances (no stop/detach)
-    * AWS's documented extend procedure does not cover RAID or LVM -> if the mount
-      cannot be proven to map to exactly one volume, ABORT and notify a human.
-      Partitions and single-volume roots ARE resolved host-side by the resolver step.
+    * AWS's documented extend procedure does not cover partitions, the ROOT FILE
+      SYSTEM, RAID or LVM -> all of these ABORT and notify a human:
+        - RAID/LVM: the mount cannot be proven to map to exactly one volume
+        - root: detected from the instance's RootDeviceName, with a device-name
+          fallback ('/dev/xvda', '/dev/sda1', ...) if that lookup is unavailable
+      A single-volume NON-ROOT instance still resolves host-side as normal.
 
   Because growth is irreversible, this is OPT-IN per volume via the
   DiskAutoGrow=true tag, and bounded by a size ceiling.
@@ -250,6 +253,62 @@ mainSteps:
                 result['action'] = 'aborted'
                 result['checks'].append(f'unsupported device type: {device}')
                 return result
+
+            # ---- Guard: root volume --------------------------------------
+            # AWS's documented extend procedure explicitly does NOT cover the
+            # root file system, so growing it would go beyond what AWS has
+            # validated — abort and let a human decide.
+            #
+            # THIS GUARD WAS MISSING AND THE GAP WAS REAL. UNSUPPORTED_DEVICES
+            # above only matches 'ephemeral'/'instance-store', so a root device
+            # ('/dev/xvda', '/dev/sda1') passed straight through it. Worse, the
+            # single-volume branch skips mount resolution entirely, so a
+            # one-volume instance whose ROOT volume carried DiskAutoGrow=true
+            # would have been snapshotted and grown — exactly what the design
+            # docs say does not happen. The opt-in tag was the only thing
+            # standing in the way, and that is a user-controlled setting, not a
+            # structural check.
+            #
+            # RootDeviceName from DescribeInstances is authoritative; the
+            # name list is a fallback for when that call is unavailable
+            # (throttling, or a role missing ec2:DescribeInstances). Failing
+            # closed here is deliberate: growth is irreversible.
+            root_device = None
+            try:
+                reservations = ec2.describe_instances(
+                    InstanceIds=[iid]
+                ).get('Reservations', [])
+                if reservations and reservations[0].get('Instances'):
+                    root_device = reservations[0]['Instances'][0].get(
+                        'RootDeviceName'
+                    )
+            except Exception as exc:                       # noqa: BLE001
+                result['checks'].append(
+                    f'RootDeviceName lookup failed ({exc}) — '
+                    f'falling back to device-name matching'
+                )
+
+            if root_device and device == root_device:
+                result['action'] = 'aborted'
+                result['checks'].append(
+                    f'{device} is the ROOT volume (RootDeviceName={root_device}) '
+                    f"— AWS's extend procedure does not cover the root file "
+                    f'system. Notifying rather than growing.'
+                )
+                return result
+            if not root_device and device in ('/dev/xvda', '/dev/xvda1',
+                                              '/dev/sda', '/dev/sda1'):
+                result['action'] = 'aborted'
+                result['checks'].append(
+                    f'{device} matches a conventional root device name and '
+                    f'RootDeviceName could not be confirmed — aborting rather '
+                    f'than risk growing the root volume irreversibly.'
+                )
+                return result
+            result['checks'].append(
+                f'{device} is not the root volume'
+                + (f' (root is {root_device})' if root_device else '')
+            )
 
             # ---- Guard: size ceiling ------------------------------------
             if size >= max_size:

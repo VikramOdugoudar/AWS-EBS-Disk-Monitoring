@@ -176,7 +176,7 @@ prod. Scoping the query is what makes two thresholds possible from one design.
 ```sql
 SELECT MAX(disk_used_percent)
 FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
-WHERE AWS.AccountId = '111122223333' AND Environment = 'prod'
+WHERE AWS.AccountId = '444455556666' AND Environment = 'prod'
 GROUP BY InstanceId
 ORDER BY MAX() DESC
 ```
@@ -193,8 +193,8 @@ ORDER BY MAX() DESC
 - `WHERE` scopes the alarm **and bounds its cost**, because billing follows what the
   filter matches.
 - `GROUP BY InstanceId` — `path` is deliberately **absent**, so all mounts on a host
-  collapse into one contributor: 1,000 contributors instead of 3,000, comfortably inside
-  the 500-series return cap once split per account.
+  collapse into one contributor. Scoped per account and environment, that means the
+  500-series return cap binds at ~500 instances rather than ~160.
 - `MAX` gives each contributor its **fullest mount**.
 - `ORDER BY MAX() DESC` sorts fullest first.
 
@@ -213,8 +213,7 @@ launch and deleted on terminate, reconciled constantly against Auto Scaling chur
 fatal flaw is not tedium — it is that a **missed creation leaves an instance silently
 unmonitored**. No error, no red state, nothing to notice. Discovered during the outage.
 
-**2. `SEARCH()` inside an alarm.** *"A search expression cannot be used within an
-Alarm."* The reason is structural: an alarm must resolve to **one deterministic state**
+**2. `SEARCH()` inside an alarm.** AWS does not permit it. The reason is structural: an alarm must resolve to **one deterministic state**
 to decide whether an action fires, and `SEARCH` returns an arbitrary, unordered number of
 series.
 
@@ -224,13 +223,11 @@ instances**.
 
 ### Why Metrics Insights is the only fit
 
-- It is the **sole alarm type accepting multi-series queries** — *"You can create an
-  alarm on any Metrics Insights query, including queries that return multiple time
-  series."*
-- It **auto-adopts resources**: *"the alarm automatically adjusts as resources are added
-  to or removed from your monitored group… any resource that matches your query
-  definition… joins the alarm monitoring scope."* So **a new instance needs no alarm
-  created** — which eliminates dead-end 1's entire failure mode rather than mitigating it.
+- It is the **only alarm type that can evaluate multiple time series** — AWS: *"Only
+  alarms based on Metrics Insights SQL queries can operate on multiple time series."*
+- It **auto-adopts resources**: the query catches new and changed resources, so an alarm
+  watching a fleet automatically evaluates instances launched after it was created. **A new
+  instance needs no alarm created** — which eliminates dead-end 1's failure mode outright.
 - Each returned series is a **contributor** with its own state, so one alarm resource
   performs N independent evaluations and fires if **any** contributor breaches.
 
@@ -564,9 +561,11 @@ label = '1 - i-0aaa...aaa /data'      value = 84.55%
 Splitting on whitespace and reading fields 0 and 1 yields `"1"` and `"-"`. **Parse from the
 end** (`parts[-2]`, `parts[-1]`) or strip the `N - ` prefix first (`tested_findings.md` §7).
 
-It reports **all** attached volumes when the mapping is ambiguous (LVM/RAID) and says so,
-rather than asserting a single answer. **A scheme assuming 1:1 would mislead precisely on
-the hosts where storage is most complex** — the worst place to be confidently wrong.
+Where the mapping is ambiguous (LVM/RAID) the Lambda reports the mount as `UNRESOLVED` and
+hands the responder the command to run by hand, rather than asserting a single answer. The
+**runbook** goes further on the remediation path, listing every attached volume as
+`candidate_volumes` and aborting. **A scheme assuming 1:1 would mislead precisely on the hosts
+where storage is most complex** — the worst place to be confidently wrong.
 
 Note the cost framing: volume identity is resolved **once per alert**, not carried in
 every datapoint forever.

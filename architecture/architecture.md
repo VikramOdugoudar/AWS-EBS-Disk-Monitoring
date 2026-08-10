@@ -189,9 +189,9 @@ flowchart TB
 
 | Approach | Why it fails |
 |---|---|
-| One alarm per VM per mount | 3,000 alarms at 1,000 VMs; a missed creation = **silently unmonitored** |
-| `SEARCH()` in an alarm | *"A search expression cannot be used within an Alarm"* — an alarm must resolve to ONE state |
-| Metric math | *"maximum of 10 metrics … cannot be increased"* ≈ 3 instances |
+| One alarm per VM per mount | 1,000 VMs x 3 mounts = 3,000 alarms; a missed creation = **silently unmonitored** |
+| `SEARCH()` in an alarm | Not permitted — an alarm must resolve to ONE state |
+| Metric math | Capped at 10 metrics per expression, and AWS states this cannot be raised ≈ 3 instances |
 
 **`MAX`, never `AVG`:** a host at 45/94/20% averages to 53% — under an 80% threshold
 while a filesystem is nearly full.

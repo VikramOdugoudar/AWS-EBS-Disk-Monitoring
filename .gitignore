@@ -10,3 +10,7 @@ ansible/inventory/*.aws_ec2.yml
 
 # Local editor / OS noise
 .DS_Store
+
+# Working notes kept alongside the project for continuity between sessions.
+# Not part of the submission and deliberately never published.
+.context/

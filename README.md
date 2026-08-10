@@ -433,15 +433,22 @@ ranking that per-account alarms structurally cannot give; and worst disk per env
 
 ### 4.6 Alarming
 
-**One warning and one critical alarm, per account, per environment.**
+**Two disk alarms per account per environment — warning and critical — plus a guard alarm.**
+
+CloudWatch **Metrics Insights** is a SQL dialect over metric data, and the only alarm type that
+can evaluate many time series at once. One query covers an entire account:
 
 ```sql
 SELECT MAX(disk_used_percent)
 FROM SCHEMA("CWAgent", InstanceId, path, Environment, fstype)
-WHERE AWS.AccountId = '111122223333' AND Environment = 'prod'
+WHERE AWS.AccountId = '444455556666' AND Environment = 'prod'
 GROUP BY InstanceId
 ORDER BY MAX() DESC
 ```
+
+Each series the query returns is a **contributor** with its own state. One alarm therefore
+performs N independent evaluations and fires if any single contributor breaches — which is how
+one alarm covers a thousand VMs.
 
 | Environment | Warning | Critical |
 |---|---|---|
@@ -451,18 +458,22 @@ ORDER BY MAX() DESC
 Differentiated thresholds are the point — a single global threshold is either too noisy for dev,
 where a build box at 85% is normal, or too late for prod.
 
-**Why Metrics Insights is the only fit.** It is the **sole alarm type accepting multi-series
-queries**, and it **auto-adopts resources**: *"any resource that matches your query definition…
-joins the alarm monitoring scope"*. So **a new instance needs no alarm created** — which
-eliminates the worst failure mode of the obvious alternative rather than merely mitigating it.
+Both alarms use five-minute periods with M-of-N evaluation: warning fires on **2 of 3** periods,
+so a breach must persist ~10 minutes and a build's temp file does not page anyone. Critical is
+tightened to **2 of 2** — at 90% you would rather be early.
+
+**Why Metrics Insights.** Per AWS, *"only alarms based on Metrics Insights SQL queries can
+operate on multiple time series."* And the query re-evaluates its own membership every period:
+an instance that matches joins the alarm automatically, one that terminates drops out. **Nothing
+creates an alarm when a VM launches, so nothing can fail to.**
 
 **The three simpler approaches are dead ends:**
 
 | Approach | Why it fails |
 |---|---|
-| One alarm per VM per mount | 3,000 alarms at 1,000 VMs, reconciled against ASG churn. The fatal flaw is not tedium — **a missed creation leaves an instance silently unmonitored**, discovered during the outage |
-| `SEARCH()` inside an alarm | *"A search expression cannot be used within an Alarm"* — an alarm must resolve to ONE state |
-| Metric math | *"maximum of 10 metrics … cannot be increased"* ≈ three instances |
+| One alarm per VM per mount | 1,000 VMs × 3 mounts = 3,000 alarms, created on launch, deleted on terminate, reconciled against ASG churn. The fatal flaw is not tedium — **a missed creation leaves an instance silently unmonitored**, discovered during the outage |
+| `SEARCH()` inside an alarm | Not permitted — an alarm must resolve to ONE state, and `SEARCH` returns an arbitrary, unordered number of series |
+| Metric math | Capped at **10 metrics** per expression, and AWS states this cannot be raised ≈ three instances |
 
 **Four details that are correctness, not style:**
 
@@ -471,28 +482,41 @@ eliminates the worst failure mode of the obvious alternative rather than merely 
   threshold while a filesystem is nearly full.
 - **`ORDER BY MAX() DESC` decides which series are evaluated** past the 500-series cap. Ascending
   order would silently evaluate the emptiest disks.
-- **`path` is deliberately absent from `GROUP BY`.** One contributor per host instead of three
-  keeps the design comfortably inside the 500-series cap. The pilot confirmed this costs nothing:
-  finer grouping triples the contributor count and returns **nothing** operationally (§5).
-- **`SCHEMA()` is an exact-set match, and must name all four dimensions.** Naming three matches
-  **zero** series — and, combined with `TreatMissingData: notBreaching`, a zero-match query
-  reports a reassuring green **`OK` forever** rather than `INSUFFICIENT_DATA`. This is the single
-  most consequential silent failure in the design, which is why deployment
-  ([`docs/07`](docs/07-deployment.md)) gates alarm creation behind a `list-metrics` check.
+- **`path` is deliberately absent from `GROUP BY`.** All mounts on a host collapse into one
+  contributor, so the 500-series cap binds at **~500 instances per account-environment scope**
+  rather than ~160 if `path` were included. The pilot confirmed the finer grouping costs 3× the
+  contributors and returns **nothing** operationally ([`tested_findings.md`](tested_findings.md) §3).
+- **`SCHEMA()` names what exists, not what you want back.** The agent emits exactly four
+  dimensions — `InstanceId`, `path`, `Environment`, `fstype` — and the clause must list all four;
+  listing three matches **zero** series, verified live. **The failure is silent by construction:**
+  `TreatMissingData: notBreaching` is set so a terminated instance's silence is not read as a full
+  disk, and a zero-match query is indistinguishable from that silence — green **`OK` indefinitely**,
+  with `InsufficientDataActions` never firing. It is the design's most consequential silent
+  failure, which is why [`docs/07`](docs/07-deployment.md) gates alarm creation behind a
+  `list-metrics` check.
 
-**The `PARTIAL_DATA` guard alarm** exists because the scaling ceiling fails silently: past 10,000
-matched metrics an alarm sets `EvaluationState: PARTIAL_DATA` and **keeps reporting a state
-derived from incomplete data** — healthy-looking while monitoring part of the fleet. Without the
-guard, the design would reproduce the exact silent-blind-spot flaw that disqualified per-VM
-alarms.
+**A guard alarm watches the ceiling.** A query processes at most 10,000 metrics (~3,300 VMs at
+3 mounts); past that AWS *"only processes the first 10,000 metrics that it finds"* and the alarm
+keeps reporting a confident state derived from part of the fleet — the same blind spot that
+disqualified per-VM alarms. So a third alarm counts datapoints and warns at a 3,000-metric
+equivalent. **Its threshold is 180,000, not 3,000:** `COUNT()` counts datapoints, and at
+`Period: 3600` against a 60-second interval each metric contributes 60. An earlier draft used
+400 — about seven metrics — and sat in `ALARM` from first deploy. ⚠️ Untested at volume: the
+pilot ran two instances.
 
 → [`cloudformation/20-alarms-dashboard.yaml`](cloudformation/20-alarms-dashboard.yaml) ·
 [`docs/04-aggregation-alarming.md`](docs/04-aggregation-alarming.md)
 
 ### 4.7 Notification & enrichment
 
-**Two SNS topics**, so warnings and pages route differently — a warning that pages at 3am trains
-people to ignore alerts.
+**Two SNS topics** — warning and critical — so the two tiers can reach different subscribers. But
+note which message goes where. The **alarms** publish to their own tier's topic; that notification
+is identity-free (*"1 out of 7 time series evaluated to ALARM"*) and exists mainly as a fallback
+if enrichment fails. The **enrichment Lambda** — the one that names the instance, mount and
+volume — publishes to a *single* topic, putting the tier in the subject line rather than in the
+routing. So severity is visible in the enriched alert but does not decide who receives it. Making
+it decide is a small change: a second ARN, and a selection on the `level` the Lambda already
+computes.
 
 **A fleet alarm carries no identity, at any grouping.** This is the finding that most changed the
 design. A firing Metrics Insights alarm reports only a count:
@@ -506,32 +530,65 @@ No instance, no path, no volume. The natural assumption is that this is a *group
 that putting `path` back into `GROUP BY` would name the breaching filesystem. **It does not.** The
 identity exists in the query **result** and is never copied into the **alarm**.
 
-**So the enrichment Lambda is mandatory, not an enhancement.** It is the only path from
-"something breached" to "this volume needs growing":
+**So the enrichment Lambda is mandatory, not an enhancement.** EventBridge invokes it on alarm
+state change, and it is the only path from "something breached" to "this volume needs growing":
 
-1. re-runs the alarm's query **with `path`**, recovering what the alarm grouped away
-2. resolves `path` → EBS volume **on the host**
-3. posts instance · account · mount · % used · volume id · size · dashboard link
-4. at the critical tier, invokes the remediation runbook — supplying the `InstanceId` the alarm
-   cannot
+1. **Re-runs the alarm's query with `path`**, recovering what the alarm grouped away. Labels come
+   back rank-prefixed — `1 - i-0aaa…aaa /data` — so they are parsed from the **end**. Splitting on
+   whitespace and taking the first two fields yields `"1"` and `"-"`, which an earlier version did.
+2. **Resolves `path` → EBS volume on the host** (below). It assumes a role into the workload
+   account to do so: OAM shares metric *query access* only, not EC2 or SSM resources.
+3. **Posts** instance · mount · % used · volume id · size and type · guest device · whether
+   `DiskAutoGrow` is set, plus the dashboard link and the alarm's original `StateReason` (account
+   and environment ride in the subject). At the critical tier it also carries the reminder that
+   `ModifyVolume` grows the volume, not the filesystem (§4.8).
+4. **At the critical tier, invokes the remediation runbook** — supplying the `InstanceId` the
+   alarm cannot, and passing `DryRun: 'false'` explicitly. Two opt-ins gate it:
+   `ENABLE_REMEDIATION` per deployment (**default off**) and `DiskAutoGrow=true` per volume.
 
-**Volume resolution must run in the guest, and this is counter-intuitive.** `ec2:DescribeVolumes`
-looks like the obvious answer and is not: it reports the **attachment** device name, and on Nitro
-the guest kernel renames the device.
+**If the host does not answer, the alert still goes out** — without the volume id, saying so, and
+carrying the command to run by hand. A full disk is exactly when a host may stop responding;
+losing the alert to a failed enrichment step would be the wrong trade.
+
+**Volume resolution must run in the guest, and this is counter-intuitive.** The alarm gives you a
+mount path; remediation needs a volume id. `ec2:DescribeVolumes` looks like the bridge between
+them and is not — it reports the device name requested at *attach* time, which is not the name the
+guest uses. On Nitro, EBS volumes appear as NVMe devices:
 
 ```
 EC2 says   : vol-0ccc…ccc  →  /dev/sdf
 guest says : /data         →  /dev/nvme1n1
 ```
 
-There is no `/dev/sdf` block device in the guest — only a symlink — so matching
-`Attachments[].Device` against `findmnt` **cannot work**. The verified method is
-`/sbin/ebsnvme-id`, with the NVMe **controller** sysfs path as fallback. Note carefully: the
-working path is `/sys/class/nvme/<ctrl>/serial`, **not** `/sys/block/<disk>/serial`, which
-returns empty on AL2023 — and therefore the intuitive `lsblk -o NAME,MOUNTPOINT,SERIAL` one-liner
-yields nothing usable.
+AWS's udev rules do create `/dev/sdf` as a symlink to `/dev/nvme1n1`, but `findmnt` reports the
+resolved device rather than the link — so the two names never match, and **matching
+`Attachments[].Device` cannot work.**
 
-→ [`lambda/enrich_disk_alarm.py`](lambda/enrich_disk_alarm.py)
+**So ask the host instead.** The volume id is embedded in the NVMe serial. `/sbin/ebsnvme-id` is
+AWS's own tool and prints it directly; reading `/sys/class/nvme/<ctrl>/serial` is the fallback,
+needing only a `vol` → `vol-` fixup.
+
+⚠️ **Two sysfs paths look almost identical and only one works.** That **controller** path returns
+the serial; the **block-device** path `/sys/block/<disk>/serial` returns empty on AL2023 — which
+is also why the obvious `lsblk -o NAME,MOUNTPOINT,SERIAL` one-liner comes back blank, since that
+is the attribute it reads.
+
+**All of the above is specific to Nitro, and the two hardware generations behave oppositely:**
+
+| | **Nitro** (current generation) | **Xen** (m4, c4, t2 and older) |
+|---|---|---|
+| EBS presented as | NVMe — `/dev/nvme1n1` | Xen blkfront — `/dev/xvdf` |
+| The attach name `/dev/sdf` | a udev **symlink** only | maps predictably (`sd` → `xvd`) |
+| Matching `Attachments[].Device` | **fails** — the names are unrelated | broadly works |
+| Volume id readable on the host | yes, from the NVMe serial | **no NVMe serial exists** |
+
+So the design solves the harder case and only the harder case: on Xen both `ebsnvme-id` and the
+sysfs read are absent, so resolution would return `UNRESOLVED` — while the naive device-matching
+this section rejects would have worked there. Every current-generation instance family is Nitro,
+so this is a stated scope limit rather than a live gap (assumption 9).
+
+→ [`lambda/enrich_disk_alarm.py`](lambda/enrich_disk_alarm.py) — written and reviewed,
+**not yet deployed** (§8.1)
 
 ### 4.8 Remediation
 
@@ -837,6 +894,7 @@ stating it, that is marked ✅.
 | 6 | Pricing figures are **single-Region list prices** | Rates are per-Region and must be re-verified at implementation. Directionally reliable; **not quotable to finance** |
 | 7 | Instances have a **consistent security group** referenced by the endpoint SG | A heterogeneous estate needs per-account endpoint parameters |
 | 8 | `Environment` tagging is **reasonably consistent** | Untagged instances default to `Environment=unscoped` and fall outside every environment-scoped alarm — **monitored but not covered, which looks fine**. Surfaced by Config compliance rather than by an alarm |
+| 9 | Instances are **Nitro-based** (current-generation families) | Only affects volume resolution (§4.7). On older Xen instances EBS appears as `/dev/xvd*` with no NVMe serial, so both `ebsnvme-id` and the sysfs read return nothing and the enrichment Lambda reports `UNRESOLVED` — detection and alarming are unaffected. Xen would need the `sd` → `xvd` device-name mapping instead |
 
 ---
 
@@ -909,6 +967,10 @@ managed nodes at 80% of 2,400; Metrics Insights alarms at 80% of 200; concurrent
   cannot auto-deploy to an OU the way the IAM stack does.
 - **StackSet operations can fail quietly** in a single account, leaving it unmonitored while the
   overall operation reports success.
+- **Dynamic inventory is cached for 300s**, so an instance stopping inside that window is still
+  targeted and fails as unreachable, spending the `max_fail_percentage` budget — a race inherent
+  to push-based configuration that can be narrowed but not closed
+  ([`docs/02`](docs/02-execution-model.md)).
 
 ---
 

@@ -47,10 +47,12 @@ Resources:
   # alarm, metric math) and the cost model are in docs/04-aggregation-alarming.md.
   #
   # Three things you can break by editing the query below:
-  #   * SCHEMA(...) must name EVERY dimension the agent emits, or NOTHING matches and
-  #     the alarm sits in INSUFFICIENT_DATA forever. It is a filter, not a projection.
-  #   * `path` is deliberately ABSENT from GROUP BY — 1,000 contributors, not 3,000,
-  #     which is what keeps this inside the 500-series return cap.
+  #   * SCHEMA(...) must name EVERY dimension the agent emits, or NOTHING matches.
+  #     It is a filter, not a projection. VERIFIED LIVE: a zero-match query does NOT
+  #     go INSUFFICIENT_DATA — with TreatMissingData: notBreaching below it reports a
+  #     green OK forever, so nothing surfaces the mistake (tested_findings.md 2).
+  #   * `path` is deliberately ABSENT from GROUP BY — one contributor per host, not
+  #     three, so the 500-series return cap binds at ~500 instances per scope, not ~160.
   #   * ORDER BY MAX() DESC is CORRECTNESS, not cosmetics: past 500 series it decides
   #     WHICH series are evaluated. And never AVG — 45/94/20% averages to 53%.
   #
@@ -92,8 +94,11 @@ Resources:
       ActionsEnabled: true
       AlarmActions:
         - !Ref WarningTopicArn
-      # Notify on INSUFFICIENT_DATA too: that state means the alarm is evaluating
-      # NOTHING (usually a dimension mismatch), so it looks calm while blind.
+      # Notify on INSUFFICIENT_DATA too — worth having for a fleet-wide agent or
+      # endpoint outage. But do NOT treat it as the guard against a dimension
+      # mismatch: that case reports green OK, never INSUFFICIENT_DATA, so this
+      # action never fires for it (tested_findings.md 2). The real defence is the
+      # list-metrics gate in docs/07 Phase 6.
       InsufficientDataActions:
         - !Ref WarningTopicArn
       OKActions:
